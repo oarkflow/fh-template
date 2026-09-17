@@ -2,20 +2,26 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	appauth "__FH_MODULE__/internal/auth"
 	appconfig "__FH_MODULE__/internal/config"
+	appdb "__FH_MODULE__/internal/database"
+	appsecurity "__FH_MODULE__/internal/security"
 	"github.com/oarkflow/authz"
 	"github.com/oarkflow/fh"
 	"github.com/oarkflow/fh/mw/contract"
 	"github.com/oarkflow/fh/mw/securetransport"
 	"github.com/oarkflow/fh/mw/session"
+	"github.com/oarkflow/squealx"
 )
 
 type assetManifest struct {
@@ -24,7 +30,7 @@ type assetManifest struct {
 	} `json:"assets"`
 }
 
-func Register(app *fh.App, cfg appconfig.Config, sessions *session.SessionManager, transport *securetransport.Transport, engine *authz.Engine, grants *appauth.GrantStore, responsePublicKey string) error {
+func Register(app *fh.App, cfg appconfig.Config, sessions *session.SessionManager, transport *securetransport.Transport, engine *authz.Engine, grants *appauth.GrantStore, guard *appsecurity.Guard, store *appdb.Store, responsePublicKey string) error {
 	manifest, err := loadManifest("web/wasm/asset-manifest.json")
 	if err != nil {
 		return err
@@ -53,9 +59,20 @@ func Register(app *fh.App, cfg appconfig.Config, sessions *session.SessionManage
 		if err != nil {
 			return err
 		}
-		if err := appauth.Login(c, sessions, user, password, cfg.LoginUser, cfg.LoginPassword); err != nil {
+		if err := appauth.Login(c, sessions, store, user, password, cfg.LoginUser, cfg.LoginPassword, "admin"); err != nil {
+			// A failed login is exactly the signal the brute-force/credential-
+			// stuffing detector needs; see security/policy/tcpguard.bcl's
+			// auth-brute-force rule. Ignore emission errors - anomaly
+			// detection must never block the auth error response itself -
+			// but a confirmed block DOES override the normal 401 so repeated
+			// attempts get a distinct, rate-limit-shaped response instead of
+			// quietly continuing to accept guesses.
+			if blocked, evalErr := guard.EmitAuthEvent(c, "auth.login_failed", user); evalErr == nil && blocked {
+				return fh.NewHTTPError(fh.StatusTooManyRequests, "TOO_MANY_ATTEMPTS", "too many failed login attempts")
+			}
 			return err
 		}
+		_, _ = guard.EmitAuthEvent(c, "auth.login_success", user)
 		c.Flash("message", "Signed in successfully.")
 		return c.JSON(fh.Map{"authenticated": true, "message": "Signed in successfully."})
 	}).Name("login").Tag("authentication")
@@ -101,7 +118,117 @@ func Register(app *fh.App, cfg appconfig.Config, sessions *session.SessionManage
 		}
 		return c.JSON(fh.Map{"accepted": true, "body": body})
 	}).Name("echo").Tag("api")
+	registerNoteRoutes(api, store, engine, guard)
 	return nil
+}
+
+// registerNoteRoutes demonstrates the full stack together: squealx for a
+// paginated, indexed read plus retried writes; authz for a per-row ABAC
+// ownership check (RBAC alone can't express "only your own notes" - it has
+// no idea which row is being touched until it's fetched); and tcpguard for
+// business-logic anomaly detection on the write path (see
+// security.Guard.EmitBusinessEvent and the note-creation-velocity rule).
+func registerNoteRoutes(api *fh.Group, store *appdb.Store, engine *authz.Engine, guard *appsecurity.Guard) {
+	api.Get("/notes", func(c fh.Ctx) error {
+		principal, _ := appauth.Principal(c)
+		paging := squealx.Paging{OrderBy: []string{"created_at DESC"}, Limit: notesPageLimit(c), Page: notesPage(c)}
+		page := store.Notes.Paginate(c.Context(), paging, map[string]any{"user_id": principal.ID})
+		if page.Error != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "NOTES_LIST_FAILED", "could not list notes")
+		}
+		return c.JSON(page)
+	}).Name("notes-list").Tag("api")
+
+	api.Post("/notes", contract.New(contract.Config{Methods: []string{"POST"}, ContentTypes: []string{"application/json"}, MaxBodyBytes: 64 << 10}), func(c fh.Ctx) error {
+		principal, _ := appauth.Principal(c)
+		var input struct {
+			Title string `json:"title"`
+			Body  string `json:"body"`
+		}
+		if err := json.Unmarshal(c.BodyCopy(), &input); err != nil || strings.TrimSpace(input.Title) == "" {
+			return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_NOTE", "title is required")
+		}
+		if blocked, err := guard.EmitBusinessEvent(c, "note.create", 0); err == nil && blocked {
+			return fh.NewHTTPError(fh.StatusTooManyRequests, "ANOMALY_DETECTED", "too many notes created too quickly")
+		}
+		note := appdb.Note{ID: newID(), UserID: principal.ID, Title: input.Title, Body: input.Body}
+		if err := store.Notes.Create(c.Context(), &note); err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "NOTE_CREATE_FAILED", "could not create note")
+		}
+		return c.Status(fh.StatusCreated).JSON(note)
+	}).Name("notes-create").Tag("api")
+
+	api.Put("/notes/:id", contract.New(contract.Config{Methods: []string{"PUT"}, ContentTypes: []string{"application/json"}, MaxBodyBytes: 64 << 10}), func(c fh.Ctx) error {
+		principal, _ := appauth.Principal(c)
+		note, err := store.Notes.First(c.Context(), map[string]any{"id": c.Param("id")})
+		if err != nil || note.ID == "" {
+			return fh.NewHTTPError(fh.StatusNotFound, "NOTE_NOT_FOUND", "note not found")
+		}
+		if err := appauth.AuthorizeOwned(c, engine, principal, "PUT", "note", note.ID, note.UserID); err != nil {
+			return err
+		}
+		var input struct {
+			Title string `json:"title"`
+			Body  string `json:"body"`
+		}
+		if err := json.Unmarshal(c.BodyCopy(), &input); err != nil || strings.TrimSpace(input.Title) == "" {
+			return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_NOTE", "title is required")
+		}
+		note.Title, note.Body, note.UpdatedAt = input.Title, input.Body, time.Now().UTC().Format(time.RFC3339)
+		if err := store.Notes.Update(c.Context(), &note, map[string]any{"id": note.ID}); err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "NOTE_UPDATE_FAILED", "could not update note")
+		}
+		return c.JSON(note)
+	}).Name("notes-update").Tag("api")
+
+	api.Delete("/notes/:id", func(c fh.Ctx) error {
+		principal, _ := appauth.Principal(c)
+		note, err := store.Notes.First(c.Context(), map[string]any{"id": c.Param("id")})
+		if err != nil || note.ID == "" {
+			return fh.NewHTTPError(fh.StatusNotFound, "NOTE_NOT_FOUND", "note not found")
+		}
+		if err := appauth.AuthorizeOwned(c, engine, principal, "DELETE", "note", note.ID, note.UserID); err != nil {
+			return err
+		}
+		if err := store.Notes.Delete(c.Context(), &note); err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "NOTE_DELETE_FAILED", "could not delete note")
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("notes-delete").Tag("api")
+}
+
+// notesPageLimit/notesPage keep list pages small and indexed (see the
+// idx_notes_user_id_created_at index in internal/database) regardless of how
+// large a user's note collection grows - a client can never force an
+// unbounded scan by omitting or inflating these query parameters.
+const (
+	notesDefaultPageLimit = 25
+	notesMaxPageLimit     = 100
+)
+
+func notesPageLimit(c fh.Ctx) int {
+	limit, err := strconv.Atoi(c.Query("limit"))
+	if err != nil || limit <= 0 {
+		return notesDefaultPageLimit
+	}
+	if limit > notesMaxPageLimit {
+		return notesMaxPageLimit
+	}
+	return limit
+}
+
+func notesPage(c fh.Ctx) int {
+	page, err := strconv.Atoi(c.Query("page"))
+	if err != nil || page <= 0 {
+		return 1
+	}
+	return page
+}
+
+func newID() string {
+	var raw [16]byte
+	_, _ = rand.Read(raw[:])
+	return hex.EncodeToString(raw[:])
 }
 
 // SPL secure mode rejects every script element, including a fixed same-origin

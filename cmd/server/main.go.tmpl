@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -15,6 +16,7 @@ import (
 	appconfig "__FH_MODULE__/internal/config"
 	appdb "__FH_MODULE__/internal/database"
 	apphttp "__FH_MODULE__/internal/httpapi"
+	appsecurity "__FH_MODULE__/internal/security"
 	"github.com/oarkflow/fh"
 	contriblogger "github.com/oarkflow/fh-contrib/logger"
 	authzmw "github.com/oarkflow/fh-contrib/mw/authz"
@@ -68,6 +70,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	guard, err := appsecurity.New(context.Background(), appsecurity.Options{
+		PolicyDir: "security/policy", Production: cfg.Production,
+		Log: func(event, requestID, effect, severity string, riskScore float64) {
+			appLogger.Info(event, "request_id", requestID, "effect", effect, "severity", severity, "risk", riskScore)
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	view := template.NewSPL("web/templates", ".html").Config(template.SPLConfig{Directory: "web/templates", SSR: true, SecureMode: true})
 	environment := fh.EnvDevelopment
 	mode := fh.ModeDevelopment
@@ -113,6 +124,7 @@ func main() {
 		}),
 		bodylimit.New(cfg.MaxBodyBytes), timeout.New(cfg.RequestTimeout),
 		ratelimiter.New(ratelimiter.Config{Max: cfg.RateLimit, Window: time.Minute, SendHeaders: true}),
+		guard.Middleware(skipStaticAndOps),
 		skip.New(session.New(sessions), skip.Any(skip.Paths("/", "/healthz"), skip.Prefixes("/assets/", "/wasm/", "/_ops/"))),
 	)
 
@@ -163,7 +175,7 @@ func main() {
 	app.Use(signer)
 	responsePublicValue, _ := responseprotocol.EncodePublicKey(responsePublic)
 	app.AddHealthCheck("database", 2*time.Second, db.Ping)
-	if err := apphttp.Register(app, cfg, sessions, transport, engine, grants, responsePublicValue); err != nil {
+	if err := apphttp.Register(app, cfg, sessions, transport, engine, grants, guard, db, responsePublicValue); err != nil {
 		log.Fatal(err)
 	}
 	app.Get("/_ops/metrics", operationAuth(cfg.OperationsToken), requestMetrics.Handler()).Name("metrics").Tag("operations")
@@ -207,6 +219,22 @@ func operationAuth(token string) fh.HandlerFunc {
 		}
 		return c.Next()
 	}
+}
+
+// skipStaticAndOps exempts static assets and framework-only endpoints from
+// tcpguard evaluation - anomaly detection is only meaningful for routes that
+// execute application/business logic.
+func skipStaticAndOps(c fh.Ctx) bool {
+	path := c.Path()
+	if path == "/" || path == "/healthz" {
+		return true
+	}
+	for _, prefix := range []string{"/assets/", "/wasm/", "/_ops/"} {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func constantEqual(a, b string) bool {
