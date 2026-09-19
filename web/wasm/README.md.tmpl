@@ -32,6 +32,9 @@ production checklist are in the application [`README.md`](../../README.md).
 | `wasm_exec.js` | Patched TinyGo runtime glue matching `securefetch.wasm` |
 | `secure-fetch.js` | Secure Fetch facade, trust validation, SRI loading |
 | `storage.js` | IndexedDB bridge for non-extractable browser device keys |
+| `client.js` | Axios-style client (interceptors, retries, timeouts) built on `secure-fetch.js` or plain Fetch |
+| `errors.js` | `FHError`, `isFHError`, `isCancel` used by `client.js` |
+| `body.js` | Shared body/response helpers used by `secure-fetch.js` and `client.js` |
 | `index.js` | Public JavaScript module entrypoint |
 | `asset-manifest.json` | SHA-256 and SRI values for the distributable assets |
 | `README.md` | Build, deployment, rotation, and troubleshooting guide |
@@ -39,6 +42,41 @@ production checklist are in the application [`README.md`](../../README.md).
 The server refuses to start if the manifest lacks integrity entries for
 `securefetch.wasm` or `wasm_exec.js`. The browser loader verifies those
 values before using the runtime.
+
+## Axios-style client
+
+`secure-fetch.js`'s `createSecureFetch`/`secure.fetch` is the low-level,
+Fetch-compatible primitive. `client.js` adds `createClient`/`createSecureClient`
+on top of it -- axios-style ergonomics for any Fetch-compatible function
+(native `fetch`, or the secure transport above): instances with shared
+defaults, request/response interceptors, automatic JSON transforms,
+query-param serialization, `timeout`, retries, and a unified `FHError`
+(`error.response.status`/`error.response.data`) instead of manually checking
+`response.ok`.
+
+```js
+import { createSecureClient, isFHError } from "/wasm/index.js";
+
+const api = await createSecureClient(secure); // wraps an existing secure.fetch handle
+
+api.interceptors.request.use((config) => {
+  console.log(`-> ${config.method} ${config.url}`);
+  return config;
+});
+
+try {
+  const { data } = await api.get("/api/me");
+  await api.post("/api/transfer", { to, amount }, { retries: 2, timeout: 5000 });
+} catch (error) {
+  if (isFHError(error)) console.error(error.code, error.response?.status, error.response?.data);
+}
+```
+
+`onUploadProgress`/`onDownloadProgress` are supported for shape parity with
+axios, but every event is a synthetic 0%/100% start/end pair
+(`event.synthetic === true`) -- the transport buffers whole request/response
+bodies rather than streaming them, so true incremental progress isn't
+available yet.
 
 ## Development and production trust
 
