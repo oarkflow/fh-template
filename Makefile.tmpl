@@ -1,7 +1,7 @@
 GO ?= go
 NPM ?= npm
 
-.PHONY: check test run keys wasm frontend check-secure-fetch
+.PHONY: check test run keys wasm frontend check-secure-fetch test-secure-fetch
 
 check:
 	$(GO) test ./...
@@ -14,6 +14,9 @@ check:
 check-secure-fetch:
 	@command -v $(NPM) >/dev/null 2>&1 || (echo "npm was not found on PATH. Install Node.js 22.6+." >&2; exit 1)
 	cd web/frontend && $(NPM) run check:secure-fetch
+
+test-secure-fetch:
+	node --test web/wasm/coalesce.test.mjs
 
 test:
 	$(GO) test ./...

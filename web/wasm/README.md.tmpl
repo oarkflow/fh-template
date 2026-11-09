@@ -78,6 +78,23 @@ axios, but every event is a synthetic 0%/100% start/end pair
 bodies rather than streaming them, so true incremental progress isn't
 available yet.
 
+## Duplicate read requests
+
+The secure Fetch client coalesces overlapping identical `GET` and `HEAD` calls
+by default, before encryption, so a burst in one browser tab sends one network
+request. Set `coalesceRequests: false` in `createSecureFetch` configuration to
+disable this. If any caller aborts a shared call, the underlying request is
+aborted for every caller. Writes and requests made after the shared call
+finishes are always sent normally. The server also coalesces overlapping reads
+for the same authenticated principal and secure session, URL including query,
+and response-varying headers. The browser key also includes request context and
+the secure session ID, request context, and a fragment (`#...`) when supplied
+as a string or URL. Fragments are removed by Fetch and never reach the server;
+they only separate client-side calls.
+
+Run `make test-secure-fetch` to check the browser coalescer's overlap, request
+key, fresh-after-completion, and abort behavior.
+
 ## Development and production trust
 
 The checked-in bundle is intended for loopback development. Development may use
