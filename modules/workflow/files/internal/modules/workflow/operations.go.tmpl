@@ -1,0 +1,222 @@
+package workflow
+
+import (
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/ref/pipeline"
+)
+
+// externalForm is what a person outside the application sees when they open a
+// signed link: only the inputs the link covers.
+type externalForm struct {
+	Name   string          `json:"name"`
+	Inputs []externalInput `json:"inputs"`
+}
+
+type externalInput struct {
+	Name     string   `json:"name"`
+	Label    string   `json:"label"`
+	Kind     string   `json:"kind"`
+	Help     string   `json:"help,omitempty"`
+	Required bool     `json:"required"`
+	Options  []string `json:"options,omitempty"`
+}
+
+// registerOperations mounts what staff do around a case beyond deciding it: book
+// a meeting, send an outside party a link, see where time goes; and what every
+// signed-in person does with their notification preferences.
+func (h host) registerOperations() {
+	svc, d := h.svc, h.d
+	staff := d.API.Group("/workflow", d.Require("workflow:work"))
+	// staffCase loads a case in the caller's tenant and audits the read.
+	staffCase := func(c fh.Ctx, event string) (*pipeline.Case, pipeline.Actor, error) {
+		cs, err := svc.Get(c.Context(), c.Param("id"))
+		if err != nil || cs.TenantID != h.tenant(c) {
+			return nil, pipeline.Actor{}, fh.NewHTTPError(fh.StatusNotFound, "CASE_NOT_FOUND", "case not found")
+		}
+		_ = svc.Audit.Append(c.Context(), h.principal(c).ID, event, cs.ID, nil)
+		return cs, h.actor(c), nil
+	}
+	throttled := func(c fh.Ctx, event string) bool {
+		if d.Guard == nil {
+			return false
+		}
+		blocked, err := d.Guard.EmitBusinessEvent(c, event, 0)
+		return err == nil && blocked
+	}
+	tooMany := func() error {
+		return fh.NewHTTPError(fh.StatusTooManyRequests, "ANOMALY_DETECTED", "too many requests")
+	}
+
+	staff.Get("/cases/:id/appointments", func(c fh.Ctx) error {
+		cs, _, err := staffCase(c, "workflow.appointments")
+		if err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"appointments": svc.Appointments(cs)})
+	}).Name("workflow-appointments").Tag("workflow")
+
+	staff.Post("/cases/:id/appointments", jsonBody(2<<10), func(c fh.Ctx) error {
+		var in struct {
+			When     string `json:"when"`
+			Location string `json:"location"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		when, err := time.Parse(time.RFC3339, in.When)
+		if err != nil {
+			return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_TIME", "when must be a date and time like 2026-12-01T11:00:00+00:00")
+		}
+		cs, a, err := staffCase(c, "workflow.book")
+		if err != nil {
+			return err
+		}
+		out, err := svc.Book(c.Context(), cs.ID, a, when, in.Location)
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.Status(fh.StatusCreated).JSON(fh.Map{"appointments": svc.Appointments(out)})
+	}).Name("workflow-book").Tag("workflow")
+
+	staff.Delete("/cases/:id/appointments/:sid", jsonBody(2<<10), func(c fh.Ctx) error {
+		var in struct {
+			Reason string `json:"reason"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		cs, a, err := staffCase(c, "workflow.cancel_appointment")
+		if err != nil {
+			return err
+		}
+		out, err := svc.CancelAppointment(c.Context(), cs.ID, a, c.Param("sid"), in.Reason)
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(fh.Map{"appointments": svc.Appointments(out)})
+	}).Name("workflow-cancel-appointment").Tag("workflow")
+
+	// An outside party fills in one form through a signed, single-use link.
+	staff.Post("/cases/:id/links", jsonBody(2<<10), func(c fh.Ctx) error {
+		var in struct {
+			Party   string   `json:"party"`
+			Scope   []string `json:"scope"`
+			TTLDays int      `json:"ttlDays"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		cs, a, err := staffCase(c, "workflow.link")
+		if err != nil {
+			return err
+		}
+		if throttled(c, "workflow.link") {
+			return tooMany()
+		}
+		if len(in.Scope) == 0 {
+			return fh.NewHTTPError(fh.StatusBadRequest, "SCOPE_REQUIRED", "name the form (or form.input) the link may fill in")
+		}
+		token, err := svc.IssueLink(c.Context(), cs.ID, a, strings.TrimSpace(in.Party), in.Scope, time.Duration(in.TTLDays)*24*time.Hour)
+		if err != nil {
+			return wfFail(err)
+		}
+		c.Set("Cache-Control", "no-store")
+		// The token is shown once, to the person who will pass it on; it is never stored.
+		return c.Status(fh.StatusCreated).JSON(fh.Map{"token": token, "path": "/ext/" + url.PathEscape(token)})
+	}).Name("workflow-link").Tag("workflow")
+
+	// Where time goes.
+	staff.Get("/:pipeline/analytics", func(c fh.Ctx) error {
+		if _, ok := svc.Engine(c.Param("pipeline")); !ok {
+			return fh.NewHTTPError(fh.StatusNotFound, "PIPELINE_NOT_FOUND", "no such workflow")
+		}
+		out, err := svc.Analytics(c.Context(), c.Param("pipeline"), h.tenant(c), 2000)
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(out)
+	}).Name("workflow-analytics").Tag("workflow")
+
+	// Notification preferences (every signed-in person).
+	d.API.Get("/notifications/preferences", func(c fh.Ctx) error {
+		prefs, err := svc.Preferences(c.Context(), h.tenant(c), h.principal(c).ID)
+		if err != nil {
+			return wfFail(err)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"preferences": prefs})
+	}).Name("notification-prefs").Tag("workflow")
+
+	d.API.Put("/notifications/preferences", jsonBody(8<<10), func(c fh.Ctx) error {
+		var in pipeline.NotifyPreferences
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := svc.SetPreferences(c.Context(), h.tenant(c), h.principal(c).ID, in); err != nil {
+			return wfFail(err)
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("notification-prefs-set").Tag("workflow")
+
+	// The page a person outside the application opens from a signed link: they see
+	// only the form the link covers, with no case data and no account. Every failure
+	// gives the same answer, and opening is rate limited.
+	notValid := func() error {
+		return fh.NewHTTPError(fh.StatusNotFound, "LINK_INVALID", "this link is not valid, has expired or was already used")
+	}
+	d.App.Get("/ext/:token", func(c fh.Ctx) error {
+		if throttled(c, "external.open") {
+			return tooMany()
+		}
+		x, err := svc.OpenLink(c.Context(), c.Param("token"))
+		if err != nil {
+			return notValid()
+		}
+		var forms []externalForm
+		seen := map[string]bool{}
+		for _, sc := range x.Actor.Link.Scope {
+			form, input, _ := strings.Cut(sc, ".")
+			inputs, ok := x.Engine.C.FormInputs(form)
+			if !ok || seen[sc] {
+				continue
+			}
+			seen[sc] = true
+			f := externalForm{Name: form, Inputs: []externalInput{}}
+			for _, in := range inputs {
+				if input != "" && in.Name != input {
+					continue
+				}
+				f.Inputs = append(f.Inputs, externalInput{Name: in.Name, Label: in.Label, Kind: in.Kind, Help: in.Help, Required: in.Required, Options: in.Options})
+			}
+			forms = append(forms, f)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"party": x.Actor.Link.Party, "expiresAt": x.Actor.Link.Expires, "forms": forms})
+	}).Name("external-open").Tag("external")
+
+	d.App.Post("/ext/:token", jsonBody(16<<10), func(c fh.Ctx) error {
+		if d.SameOrigin != nil && !d.SameOrigin(c) {
+			return fh.NewHTTPError(fh.StatusForbidden, "ORIGIN_REJECTED", "same-origin submission required")
+		}
+		if throttled(c, "external.submit") {
+			return tooMany()
+		}
+		var in struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := svc.SubmitLink(c.Context(), c.Param("token"), in.Data); err != nil {
+			if _, openErr := svc.OpenLink(c.Context(), c.Param("token")); openErr != nil {
+				return notValid()
+			}
+			return wfFail(err)
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("external-submit").Tag("external")
+}

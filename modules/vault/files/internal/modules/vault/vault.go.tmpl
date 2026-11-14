@@ -1,0 +1,331 @@
+// Package vault provides field-level envelope encryption, blind indexes and
+// crypto-shredding for PII .
+//
+// Each subject has a data-encryption key (DEK). DEKs are wrapped by a
+// key-encryption key (KEK) held by a KMS implementation. Field ciphertexts bind
+// table, column and row id as AAD so a ciphertext cannot be moved between rows.
+package vault
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"unicode"
+
+	"golang.org/x/text/unicode/norm"
+)
+
+// KMS wraps and unwraps data keys. Implementations: FileKMS (dev/test) and,
+// later, a cloud KMS adapter.
+type KMS interface {
+	Wrap(keyVersion string, dek []byte, aad []byte) ([]byte, error)
+	Unwrap(keyVersion string, wrapped []byte, aad []byte) ([]byte, error)
+	CurrentVersion() string
+	// IndexKey returns the HMAC key used for blind indexes.
+	IndexKey() []byte
+}
+
+var (
+	ErrShredded = errors.New("vault: subject key destroyed")
+	ErrTampered = errors.New("vault: ciphertext failed authentication")
+)
+
+// MemoryKMS is an in-process KMS for development and tests. Keys are random per
+// process unless supplied, so ciphertexts do not survive a restart.
+type MemoryKMS struct {
+	mu      sync.RWMutex
+	keks    map[string][]byte
+	current string
+	index   []byte
+}
+
+// NewMemoryKMS builds a KMS from a master secret of at least 32 bytes. A
+// version label allows rotation: add keys with AddVersion and SetCurrent.
+func NewMemoryKMS(version string, kek, indexKey []byte) (*MemoryKMS, error) {
+	if len(kek) != 32 {
+		return nil, errors.New("vault: KEK must be 32 bytes")
+	}
+	if len(indexKey) < 32 {
+		return nil, errors.New("vault: index key must be at least 32 bytes")
+	}
+	return &MemoryKMS{keks: map[string][]byte{version: append([]byte(nil), kek...)}, current: version, index: append([]byte(nil), indexKey...)}, nil
+}
+
+// RandomMemoryKMS returns a KMS with fresh random keys (development only).
+func RandomMemoryKMS() *MemoryKMS {
+	kek, idx := make([]byte, 32), make([]byte, 32)
+	_, _ = rand.Read(kek)
+	_, _ = rand.Read(idx)
+	k, _ := NewMemoryKMS("dev-1", kek, idx)
+	return k
+}
+
+// AddVersion registers an additional KEK (for unwrapping older DEKs) and
+// optionally makes it current.
+func (m *MemoryKMS) AddVersion(version string, kek []byte, makeCurrent bool) error {
+	if len(kek) != 32 {
+		return errors.New("vault: KEK must be 32 bytes")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.keks[version] = append([]byte(nil), kek...)
+	if makeCurrent {
+		m.current = version
+	}
+	return nil
+}
+
+func (m *MemoryKMS) CurrentVersion() string { m.mu.RLock(); defer m.mu.RUnlock(); return m.current }
+func (m *MemoryKMS) IndexKey() []byte       { return m.index }
+
+func (m *MemoryKMS) aead(version string) (cipher.AEAD, error) {
+	m.mu.RLock()
+	kek, ok := m.keks[version]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("vault: unknown KEK version %q", version)
+	}
+	return newGCM(kek)
+}
+
+func (m *MemoryKMS) Wrap(version string, dek, aad []byte) ([]byte, error) {
+	a, err := m.aead(version)
+	if err != nil {
+		return nil, err
+	}
+	return seal(a, dek, aad)
+}
+
+func (m *MemoryKMS) Unwrap(version string, wrapped, aad []byte) ([]byte, error) {
+	a, err := m.aead(version)
+	if err != nil {
+		return nil, err
+	}
+	return open(a, wrapped, aad)
+}
+
+func newGCM(key []byte) (cipher.AEAD, error) {
+	b, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(b)
+}
+
+func seal(a cipher.AEAD, plain, aad []byte) ([]byte, error) {
+	nonce := make([]byte, a.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return a.Seal(nonce, nonce, plain, aad), nil
+}
+
+func open(a cipher.AEAD, ct, aad []byte) ([]byte, error) {
+	if len(ct) < a.NonceSize()+a.Overhead() {
+		return nil, ErrTampered
+	}
+	out, err := a.Open(nil, ct[:a.NonceSize()], ct[a.NonceSize():], aad)
+	if err != nil {
+		return nil, ErrTampered
+	}
+	return out, nil
+}
+
+// WrappedKey is the persisted form of a subject DEK.
+type WrappedKey struct {
+	Version string
+	Blob    []byte
+}
+
+// KeyStore persists wrapped DEKs. Deleting a row shreds the subject.
+type KeyStore interface {
+	Get(subjectID string) (WrappedKey, bool, error)
+	Put(subjectID string, k WrappedKey) error
+	Delete(subjectID string) error
+}
+
+// Vault encrypts and decrypts fields for subjects.
+type Vault struct {
+	kms   KMS
+	keys  KeyStore
+	mu    sync.Mutex
+	cache map[string][]byte // plaintext DEKs; bounded by Evict/Shred
+}
+
+func New(kms KMS, keys KeyStore) *Vault {
+	return &Vault{kms: kms, keys: keys, cache: map[string][]byte{}}
+}
+
+func dekAAD(subjectID string) []byte { return []byte("fh/dek/" + subjectID) }
+
+// dek returns the subject DEK, creating one when create is true.
+func (v *Vault) dek(subjectID string, create bool) ([]byte, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if d, ok := v.cache[subjectID]; ok {
+		return d, nil
+	}
+	wk, ok, err := v.keys.Get(subjectID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if !create {
+			return nil, ErrShredded
+		}
+		d := make([]byte, 32)
+		if _, err := rand.Read(d); err != nil {
+			return nil, err
+		}
+		ver := v.kms.CurrentVersion()
+		blob, err := v.kms.Wrap(ver, d, dekAAD(subjectID))
+		if err != nil {
+			return nil, err
+		}
+		if err := v.keys.Put(subjectID, WrappedKey{Version: ver, Blob: blob}); err != nil {
+			return nil, err
+		}
+		v.cache[subjectID] = d
+		return d, nil
+	}
+	d, err := v.kms.Unwrap(wk.Version, wk.Blob, dekAAD(subjectID))
+	if err != nil {
+		return nil, err
+	}
+	v.cache[subjectID] = d
+	return d, nil
+}
+
+func fieldAAD(table, column, rowID string) []byte {
+	return []byte("fh/field/" + table + "/" + column + "/" + rowID)
+}
+
+// Encrypt seals plaintext for the subject, bound to table/column/row.
+func (v *Vault) Encrypt(subjectID, table, column, rowID string, plain []byte) (string, error) {
+	d, err := v.dek(subjectID, true)
+	if err != nil {
+		return "", err
+	}
+	a, err := newGCM(d)
+	if err != nil {
+		return "", err
+	}
+	ct, err := seal(a, plain, fieldAAD(table, column, rowID))
+	if err != nil {
+		return "", err
+	}
+	return "v1." + base64.RawURLEncoding.EncodeToString(ct), nil
+}
+
+// Decrypt opens a value produced by Encrypt. After Shred it returns ErrShredded.
+func (v *Vault) Decrypt(subjectID, table, column, rowID, enc string) ([]byte, error) {
+	if !strings.HasPrefix(enc, "v1.") {
+		return nil, ErrTampered
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(enc, "v1."))
+	if err != nil {
+		return nil, ErrTampered
+	}
+	d, err := v.dek(subjectID, false)
+	if err != nil {
+		return nil, err
+	}
+	a, err := newGCM(d)
+	if err != nil {
+		return nil, err
+	}
+	return open(a, raw, fieldAAD(table, column, rowID))
+}
+
+// Shred destroys the subject's DEK. Ciphertext, including in backups, becomes
+// unreadable (crypto-shredding for erasure requests).
+func (v *Vault) Shred(subjectID string) error {
+	v.mu.Lock()
+	delete(v.cache, subjectID)
+	v.mu.Unlock()
+	return v.keys.Delete(subjectID)
+}
+
+// Rewrap re-wraps the subject DEK under the current KEK version (key rotation).
+func (v *Vault) Rewrap(subjectID string) error {
+	d, err := v.dek(subjectID, false)
+	if err != nil {
+		return err
+	}
+	ver := v.kms.CurrentVersion()
+	blob, err := v.kms.Wrap(ver, d, dekAAD(subjectID))
+	if err != nil {
+		return err
+	}
+	return v.keys.Put(subjectID, WrappedKey{Version: ver, Blob: blob})
+}
+
+// BlindIndex returns a keyed hash of a normalised value for exact-match lookup
+// and duplicate detection. kind separates namespaces (phone, email, doc_no).
+func (v *Vault) BlindIndex(kind, value string) string {
+	m := hmac.New(sha256.New, v.kms.IndexKey())
+	m.Write([]byte(kind))
+	m.Write([]byte{0})
+	m.Write([]byte(Normalize(kind, value)))
+	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+}
+
+// Normalize canonicalises a value before indexing. Phones keep digits only,
+// emails and names are lower-cased and NFKC folded, document numbers drop
+// separators.
+func Normalize(kind, value string) string {
+	value = norm.NFKC.String(strings.TrimSpace(value))
+	switch kind {
+	case "phone":
+		var b strings.Builder
+		for _, r := range value {
+			if unicode.IsDigit(r) {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	case "doc_no", "national_id":
+		var b strings.Builder
+		for _, r := range strings.ToUpper(value) {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	default:
+		return strings.ToLower(strings.Join(strings.Fields(value), " "))
+	}
+}
+
+// MemoryKeyStore is an in-memory KeyStore for tests.
+type MemoryKeyStore struct {
+	mu sync.Mutex
+	m  map[string]WrappedKey
+}
+
+func NewMemoryKeyStore() *MemoryKeyStore { return &MemoryKeyStore{m: map[string]WrappedKey{}} }
+func (s *MemoryKeyStore) Get(id string) (WrappedKey, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.m[id]
+	return k, ok, nil
+}
+func (s *MemoryKeyStore) Put(id string, k WrappedKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m[id] = k
+	return nil
+}
+func (s *MemoryKeyStore) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, id)
+	return nil
+}

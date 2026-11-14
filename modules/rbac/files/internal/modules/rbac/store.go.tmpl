@@ -1,0 +1,155 @@
+package rbac
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/oarkflow/authz"
+	"github.com/oarkflow/squealx"
+)
+
+// Roles belong to a tenant: each organisation has its own roles, grants and
+// history. The authz engine is one engine for every tenant; a role is known to
+// it as "<tenant>/<role id>" so two tenants' roles can never be confused, and
+// every decision is made inside the tenant of the account that asks.
+
+// Permission is "may <action> on <resource type>". The type is a bare name
+// (case, scanner); the engine sees it as "<type>.:*" so that one type can never
+// match another that merely starts with the same letters (authz treats ':' as
+// "match the rest of the segment").
+type Permission struct {
+	Action   string `json:"action"`
+	Resource string `json:"resource"`
+}
+
+// Role is a named set of permissions, optionally inheriting other roles.
+type Role struct {
+	ID          string       `json:"id" db:"id"`
+	Name        string       `json:"name" db:"name"`
+	Permissions []Permission `json:"permissions"`
+	Inherits    []string     `json:"inherits"`
+	// System roles are built in: they cannot be deleted, and admin cannot lose its wildcard.
+	System    bool   `json:"system"`
+	UpdatedAt string `json:"updatedAt"`
+	UpdatedBy string `json:"updatedBy"`
+}
+
+type roleRow struct {
+	TenantID    string `db:"tenant_id"`
+	ID          string `db:"id"`
+	Name        string `db:"name"`
+	Permissions string `db:"permissions"`
+	Inherits    string `db:"inherits"`
+	System      int    `db:"system"`
+	UpdatedAt   string `db:"updated_at"`
+	UpdatedBy   string `db:"updated_by"`
+}
+
+const roleCols = `tenant_id, id, name, permissions, inherits, system, updated_at, updated_by`
+
+func (r roleRow) role() (Role, error) {
+	out := Role{ID: r.ID, Name: r.Name, System: r.System == 1, UpdatedAt: r.UpdatedAt, UpdatedBy: r.UpdatedBy}
+	if err := json.Unmarshal([]byte(r.Permissions), &out.Permissions); err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal([]byte(r.Inherits), &out.Inherits); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// enginePattern is how a permission's resource type is written for the engine.
+func enginePattern(resource string) string {
+	if resource == "*" {
+		return "*"
+	}
+	return resource + ".:*"
+}
+
+// engineType is the resource Type a request is made against.
+func engineType(resource string) string { return resource + "." }
+
+// engineID names a tenant's role to the engine. Role ids never contain "/", so
+// the last "/" always separates the tenant (which may).
+func engineID(tenant, id string) string { return tenant + "/" + id }
+
+func splitEngineID(id string) (tenant, role string) {
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		return id[:i], id[i+1:]
+	}
+	return "", id
+}
+
+func toEngine(tenant string, r Role) *authz.Role {
+	inherits := make([]string, 0, len(r.Inherits))
+	for _, in := range r.Inherits {
+		inherits = append(inherits, engineID(tenant, in))
+	}
+	out := &authz.Role{ID: engineID(tenant, r.ID), TenantID: tenant, Name: r.Name, Inherits: inherits}
+	for _, p := range r.Permissions {
+		out.Permissions = append(out.Permissions, authz.Permission{Action: authz.Action(p.Action), Resource: enginePattern(p.Resource)})
+	}
+	return out
+}
+
+// sqlRoles implements authz.RoleStore over the rbac_roles table.
+type sqlRoles struct{ db *squealx.DB }
+
+// The database is written by the rbac service before the engine is told. The
+// engine's own Update/Delete calls only evict its caches, so they succeed
+// without writing: a role can never change behind the service's back.
+func (s sqlRoles) CreateRole(ctx context.Context, r *authz.Role) error { return nil }
+func (s sqlRoles) UpdateRole(ctx context.Context, r *authz.Role) error { return nil }
+func (s sqlRoles) DeleteRole(ctx context.Context, id string) error     { return nil }
+
+func (s sqlRoles) GetRole(ctx context.Context, id string) (*authz.Role, error) {
+	tenant, role := splitEngineID(id)
+	var row roleRow
+	if err := s.db.GetContext(ctx, &row, `SELECT `+roleCols+` FROM rbac_roles WHERE tenant_id=? AND id=?`, tenant, role); err != nil {
+		return nil, err
+	}
+	r, err := row.role()
+	if err != nil {
+		return nil, err
+	}
+	return toEngine(row.TenantID, r), nil
+}
+
+func (s sqlRoles) ListRoles(ctx context.Context, tenant string) ([]*authz.Role, error) {
+	var rows []roleRow
+	if err := s.db.SelectContext(ctx, &rows, `SELECT `+roleCols+` FROM rbac_roles WHERE tenant_id=? ORDER BY id`, tenant); err != nil {
+		return nil, err
+	}
+	out := make([]*authz.Role, 0, len(rows))
+	for _, row := range rows {
+		r, err := row.role()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, toEngine(row.TenantID, r))
+	}
+	return out, nil
+}
+
+// sqlAudit keeps denied decisions; allowed ones are dropped on purpose.
+type sqlAudit struct{ db *squealx.DB }
+
+func (a sqlAudit) LogDecision(ctx context.Context, e *authz.AuditEntry) error {
+	if e == nil || e.Decision == nil || e.Decision.Allowed || e.Subject == nil || e.Resource == nil {
+		return nil
+	}
+	_, err := a.db.ExecContext(context.Background(), `INSERT INTO rbac_denials (id, at, subject, action, resource, reason, tenant_id) VALUES (?,?,?,?,?,?,?)`,
+		e.ID+"-"+time.Now().UTC().Format("150405.000000000"), time.Now().UTC().Format(time.RFC3339), strings.SplitN(e.Subject.ID, "|", 2)[0],
+		string(e.Action), strings.TrimSuffix(e.Resource.Type, "."), e.Decision.Reason, e.Subject.TenantID)
+	return err
+}
+
+func (a sqlAudit) GetAccessLog(ctx context.Context, f authz.AuditFilter) ([]*authz.AuditEntry, error) {
+	return nil, nil // read through Service.Denials
+}
+
+func isNoRows(err error) bool { return errors.Is(err, sql.ErrNoRows) }

@@ -1,0 +1,19 @@
+package workflow
+
+import (
+	"fmt"
+	"database/sql"
+	"errors"
+	"strings"
+)
+
+func isNoRows(err error) bool { return errors.Is(err, sql.ErrNoRows) }
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func sprintf(format string, args ...any) string { return fmt.Sprintf(format, args...) }

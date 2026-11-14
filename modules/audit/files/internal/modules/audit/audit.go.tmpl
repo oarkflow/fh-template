@@ -1,0 +1,107 @@
+// Package audit keeps an append-only, hash-chained audit log. Each entry commits
+// to its predecessor, so any edit, deletion or reordering is detectable with Verify.
+package audit
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/oarkflow/squealx"
+)
+
+type Entry struct {
+	Seq      int64  `db:"seq" json:"seq"`
+	At       string `db:"at" json:"at"`
+	Actor    string `db:"actor" json:"actor"`
+	Action   string `db:"action" json:"action"`
+	Object   string `db:"object" json:"object"`
+	Meta     string `db:"meta" json:"meta"`
+	PrevHash string `db:"prev_hash" json:"prevHash"`
+	Hash     string `db:"hash" json:"hash"`
+}
+
+type Log struct {
+	db  *squealx.DB
+	mu  sync.Mutex
+	now func() time.Time
+}
+
+func New(db *squealx.DB) *Log { return &Log{db: db, now: time.Now} }
+
+const genesis = "genesis"
+
+func digest(e Entry) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", e.Seq, e.At, e.Actor, e.Action, e.Object, e.Meta, e.PrevHash)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Append writes an entry. Meta must not contain PII; callers pass ids and
+// hashes only. Appends are serialised so the chain has no forks.
+func (l *Log) Append(ctx context.Context, actor, action, object string, meta map[string]any) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	raw, _ := json.Marshal(meta)
+	var last Entry
+	prev := genesis
+	var seq int64
+	if err := l.db.GetContext(ctx, &last, `SELECT seq, at, actor, action, object, meta, prev_hash, hash FROM audit_log ORDER BY seq DESC LIMIT 1`); err == nil {
+		prev, seq = last.Hash, last.Seq
+	}
+	e := Entry{Seq: seq + 1, At: l.now().UTC().Format(time.RFC3339Nano), Actor: actor, Action: action, Object: object, Meta: string(raw), PrevHash: prev}
+	e.Hash = digest(e)
+	_, err := l.db.ExecContext(ctx, `INSERT INTO audit_log (seq, at, actor, action, object, meta, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?)`,
+		e.Seq, e.At, e.Actor, e.Action, e.Object, e.Meta, e.PrevHash, e.Hash)
+	return err
+}
+
+// Verify walks the chain and returns the first broken sequence number, or 0.
+func (l *Log) Verify(ctx context.Context) (int64, error) {
+	var rows []Entry
+	if err := l.db.SelectContext(ctx, &rows, `SELECT seq, at, actor, action, object, meta, prev_hash, hash FROM audit_log ORDER BY seq`); err != nil {
+		return 0, err
+	}
+	prev := genesis
+	for i, e := range rows {
+		if e.Seq != int64(i+1) || e.PrevHash != prev || digest(e) != e.Hash {
+			return e.Seq, nil
+		}
+		prev = e.Hash
+	}
+	return 0, nil
+}
+
+// Head returns the latest hash, suitable for external anchoring.
+func (l *Log) Head(ctx context.Context) (seq int64, hash string, err error) {
+	var e Entry
+	if err = l.db.GetContext(ctx, &e, `SELECT seq, hash FROM audit_log ORDER BY seq DESC LIMIT 1`); err != nil {
+		return 0, genesis, nil
+	}
+	return e.Seq, e.Hash, nil
+}
+
+// List returns recent entries, newest first.
+func (l *Log) List(ctx context.Context, limit int) ([]Entry, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []Entry
+	err := l.db.SelectContext(ctx, &rows, `SELECT seq, at, actor, action, object, meta, prev_hash, hash FROM audit_log ORDER BY seq DESC LIMIT ?`, limit)
+	return rows, err
+}
+
+// Chain is a reusable helper for per-object hash chains (case events).
+func Chain(prev string, parts ...string) string {
+	h := sha256.New()
+	h.Write([]byte(prev))
+	for _, p := range parts {
+		h.Write([]byte{0})
+		h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}

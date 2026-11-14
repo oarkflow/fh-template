@@ -1,0 +1,100 @@
+# Sample workflow: a request that is filled in, reviewed and approved.
+#
+#   application   the requester fills the form and submits
+#   review        an editor checks it; may send it back or reject
+#   approval      an administrator approves (a different person from the reviewer)
+#
+# Roles are the ids from config/app.bcl. "applicant" is the role every requester
+# acts under. Change stages, forms, roles and deadlines here without touching Go.
+
+pipeline "request" {
+  title "Request"
+  description "Submit a request, have it reviewed and approved"
+  number_format "REQ-{year}-{seq:6}"
+  reveal_roles ["admin"]
+
+  notes { applicant_may_write true }
+
+  notify "case.returned" {
+    to ["applicant"]
+    channels ["inbox"]
+    severity warning
+    subject "More information is needed for {case.number}"
+  }
+  notify "assigned" {
+    to ["assignee"]
+    channels ["inbox"]
+    subject "{case.number} was given to you"
+  }
+
+  on "case.returned" { hook "audit.event" }
+
+  form "request" {
+    title "The request"
+    input "title" { label "Title"  kind text  required true  min_length 3  max_length 120 }
+    input "category" { label "Category"  kind select  required true  options ["access", "purchase", "other"] }
+    input "details" { label "Details"  kind textarea  required true  min_length 10  max_length 2000 }
+  }
+
+  form "review_notes" {
+    title "Reviewer notes"
+    edit_roles ["editor", "admin"]
+    input "notes" { label "Notes"  kind textarea  max_length 2000 }
+  }
+
+  stage "application" {
+    title "Application"
+    kind form
+    public true
+    roles ["system"]
+    page {
+      title "Your request"
+      layout stacked
+      group "request" { title "Request"  forms ["request"] }
+      acknowledge "consent" {
+        title "Declaration"
+        text "I confirm these details are correct."
+      }
+    }
+    action "submit" { label "Submit"  outcome advance  next "review" }
+    action "withdraw" { label "Withdraw"  outcome withdraw }
+  }
+
+  stage "review" {
+    title "Review"
+    kind review
+    roles ["editor", "admin", "system"]
+    assign_roles ["admin"]
+    suspend_roles ["editor", "admin"]
+    sla {
+      duration "3d"
+      warn_before "6h"
+    }
+    page {
+      title "Review the request"
+      layout stacked
+      group "submitted" { title "Submitted"  mode readonly  forms ["request"] }
+      group "notes" { title "Reviewer notes"  forms ["review_notes"] }
+    }
+    action "accept" { label "Accept"  outcome advance }
+    action "return" { label "Ask for more information"  outcome return  return_to "application"  comment_required true }
+    action "reject" { label "Reject"  outcome reject  comment_required true }
+    assign "decision.reviewed_by" { value "actor.id" }
+  }
+
+  stage "approval" {
+    title "Approval"
+    kind approval
+    roles ["admin"]
+    page {
+      title "Approve the request"
+      layout stacked
+      group "summary" { title "Request"  mode summary  forms ["request"] }
+      group "notes" { title "Review"  mode readonly  forms ["review_notes"] }
+    }
+    node "sign_off" { title "Approver sign-off"  kind approval  approvals 1  distinct_from ["applicant"] }
+    action "approve" { label "Approve"  outcome advance }
+    action "return" { label "Back to review"  outcome return  return_to "review"  comment_required true }
+    action "reject" { label "Reject"  outcome reject  comment_required true }
+  }
+}

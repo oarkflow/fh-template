@@ -1,0 +1,225 @@
+package billing
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+
+	"__FH_MODULE__/internal/modules"
+)
+
+// Pricing decides what one unit of usage costs: a meter's own price, else the
+// plan's rate card in the customer's currency, reduced by the volume band the
+// customer has reached this month.
+type Pricing struct {
+	Deps
+	Billing *Service
+}
+
+func NewPricing(d Deps, b *Service) *Pricing { return &Pricing{Deps: d, Billing: b} }
+
+const (
+	MeterActive   = "active"
+	MeterDisabled = "disabled"
+)
+
+// Meter is a named source of usage (a device, an endpoint, a feature) with its
+// own per-unit price, fixed when it is registered from the plan's rate card.
+type Meter struct {
+	ID         string `db:"id" json:"id"`
+	CustomerID string `db:"customer_id" json:"customerId"`
+	Name       string `db:"name" json:"name"`
+	Currency   string `db:"currency" json:"currency"`
+	PriceMinor int64  `db:"price_minor" json:"priceMinor"`
+	Status     string `db:"status" json:"status"`
+	CreatedAt  string `db:"created_at" json:"createdAt"`
+}
+
+const meterCols = `id, customer_id, name, currency, price_minor, status, created_at`
+
+func validCode(c string) bool { return len(c) == 3 && strings.ToUpper(c) == c }
+
+// SetRate sets the price of one unit for a plan and currency (administrator).
+func (p *Pricing) SetRate(ctx context.Context, adminID, tenant, plan, currency string, priceMinor int64) error {
+	if !validCode(currency) || priceMinor < 0 || strings.TrimSpace(plan) == "" {
+		return Err(400, "INVALID_RATE", "plan is required, currency must be a 3-letter upper-case code and the price non-negative")
+	}
+	if _, err := p.DB.ExecContext(ctx, `INSERT INTO rate_cards (tenant_id, plan, currency, price_minor) VALUES (?,?,?,?)
+		ON CONFLICT(tenant_id, plan, currency) DO UPDATE SET price_minor=excluded.price_minor`, tenant, plan, currency, priceMinor); err != nil {
+		return err
+	}
+	_ = p.Audit.Append(ctx, adminID, "billing.set_rate", tenant, map[string]any{"plan": plan, "currency": currency, "priceMinor": priceMinor})
+	return nil
+}
+
+// Rate returns the per-unit price for a plan and currency.
+func (p *Pricing) Rate(ctx context.Context, tenant, plan, currency string) (int64, error) {
+	var price int64
+	err := p.DB.GetContext(ctx, &price, `SELECT price_minor FROM rate_cards WHERE tenant_id=? AND plan=? AND currency=?`, tenant, plan, currency)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, Err(400, "NO_RATE", "no price is set for plan %q in %s", plan, currency)
+	}
+	return price, err
+}
+
+// RegisterMeter adds a meter priced from the plan's rate card.
+func (p *Pricing) RegisterMeter(ctx context.Context, actor, tenant, plan, customerID, name, currency string) (Meter, error) {
+	name = strings.TrimSpace(name)
+	if n := len([]rune(name)); n < 2 || n > 80 {
+		return Meter{}, Err(400, "INVALID_METER", "name must be 2 to 80 characters")
+	}
+	price, err := p.Rate(ctx, tenant, plan, currency)
+	if err != nil {
+		return Meter{}, err
+	}
+	m := Meter{ID: "mt_" + modules.NewID()[:16], CustomerID: customerID, Name: name, Currency: currency, PriceMinor: price, Status: MeterActive, CreatedAt: p.Stamp()}
+	if _, err := p.DB.ExecContext(ctx, `INSERT INTO meters (`+meterCols+`) VALUES (?,?,?,?,?,?,?)`,
+		m.ID, m.CustomerID, m.Name, m.Currency, m.PriceMinor, m.Status, m.CreatedAt); err != nil {
+		return Meter{}, err
+	}
+	_ = p.Audit.Append(ctx, actor, "meter.register", m.ID, map[string]any{"currency": currency, "priceMinor": price})
+	return m, nil
+}
+
+func (p *Pricing) Meters(ctx context.Context, customerID string) ([]Meter, error) {
+	out := []Meter{}
+	err := p.DB.SelectContext(ctx, &out, `SELECT `+meterCols+` FROM meters WHERE customer_id=? ORDER BY created_at, id`, customerID)
+	return out, err
+}
+
+func (p *Pricing) Meter(ctx context.Context, customerID, id string) (Meter, error) {
+	var m Meter
+	err := p.DB.GetContext(ctx, &m, `SELECT `+meterCols+` FROM meters WHERE id=? AND customer_id=?`, id, customerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return m, Err(404, "METER_NOT_FOUND", "meter not found")
+	}
+	return m, err
+}
+
+func (p *Pricing) DisableMeter(ctx context.Context, actor, customerID, id string) error {
+	if _, err := p.Meter(ctx, customerID, id); err != nil {
+		return err
+	}
+	if _, err := p.DB.ExecContext(ctx, `UPDATE meters SET status=? WHERE id=?`, MeterDisabled, id); err != nil {
+		return err
+	}
+	_ = p.Audit.Append(ctx, actor, "meter.disable", id, nil)
+	return nil
+}
+
+func (p *Pricing) SetMeterPrice(ctx context.Context, adminID, id string, priceMinor int64) error {
+	if priceMinor < 0 {
+		return Err(400, "INVALID_RATE", "price must be non-negative")
+	}
+	res, err := p.DB.ExecContext(ctx, `UPDATE meters SET price_minor=? WHERE id=?`, priceMinor, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return Err(404, "METER_NOT_FOUND", "meter not found")
+	}
+	_ = p.Audit.Append(ctx, adminID, "meter.set_price", id, map[string]any{"priceMinor": priceMinor})
+	return nil
+}
+
+// Tier is a volume discount band: from this many units in a calendar month,
+// the per-unit price falls by DiscountBps basis points.
+type Tier struct {
+	Plan        string `db:"plan" json:"plan"`
+	Currency    string `db:"currency" json:"currency"`
+	FromUnits   int64  `db:"from_units" json:"fromUnits"`
+	DiscountBps int    `db:"discount_bps" json:"discountBps"`
+}
+
+func (p *Pricing) SetTier(ctx context.Context, adminID, tenant string, t Tier) error {
+	if !validCode(t.Currency) || t.FromUnits < 1 || t.DiscountBps < 1 || t.DiscountBps > 9500 || strings.TrimSpace(t.Plan) == "" {
+		return Err(400, "INVALID_TIER", "a band needs a plan, a 3-letter currency, a unit count above zero and a discount between 0.01%% and 95%%")
+	}
+	if _, err := p.DB.ExecContext(ctx, `INSERT INTO volume_tiers (tenant_id, plan, currency, from_units, discount_bps) VALUES (?,?,?,?,?)
+		ON CONFLICT(tenant_id, plan, currency, from_units) DO UPDATE SET discount_bps=excluded.discount_bps`, tenant, t.Plan, t.Currency, t.FromUnits, t.DiscountBps); err != nil {
+		return err
+	}
+	_ = p.Audit.Append(ctx, adminID, "billing.set_tier", tenant, map[string]any{"plan": t.Plan, "currency": t.Currency, "fromUnits": t.FromUnits, "discountBps": t.DiscountBps})
+	return nil
+}
+
+func (p *Pricing) DeleteTier(ctx context.Context, adminID, tenant, plan, currency string, from int64) error {
+	res, err := p.DB.ExecContext(ctx, `DELETE FROM volume_tiers WHERE tenant_id=? AND plan=? AND currency=? AND from_units=?`, tenant, plan, currency, from)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return Err(404, "TIER_NOT_FOUND", "no such band")
+	}
+	_ = p.Audit.Append(ctx, adminID, "billing.delete_tier", tenant, map[string]any{"plan": plan, "currency": currency, "fromUnits": from})
+	return nil
+}
+
+func (p *Pricing) Tiers(ctx context.Context, tenant string) ([]Tier, error) {
+	out := []Tier{}
+	err := p.DB.SelectContext(ctx, &out, `SELECT plan, currency, from_units, discount_bps FROM volume_tiers WHERE tenant_id=? ORDER BY plan, currency, from_units`, tenant)
+	return out, err
+}
+
+// DiscountBps is the discount for a customer that has already used `units`
+// this month: the highest band whose threshold has been reached. The unit being
+// priced counts as the next one.
+func (p *Pricing) DiscountBps(ctx context.Context, tenant, plan, currency string, units int64) (int, error) {
+	var bps int
+	err := p.DB.GetContext(ctx, &bps, `SELECT COALESCE((SELECT discount_bps FROM volume_tiers WHERE tenant_id=? AND plan=? AND currency=? AND from_units <= ? ORDER BY from_units DESC LIMIT 1),0)`, tenant, plan, currency, units+1)
+	return bps, err
+}
+
+// PriceFor returns what one unit of usage costs for a customer on a plan. With
+// a meterID the meter's price is used; otherwise the plan's rate in the
+// customer's first billing currency. A customer with no billing account or no
+// rate is not charged (a zero price).
+func (p *Pricing) PriceFor(ctx context.Context, tenant, plan, customerID, meterID string) (Price, error) {
+	if meterID != "" {
+		m, err := p.Meter(ctx, customerID, meterID)
+		if err != nil {
+			return Price{}, err
+		}
+		if m.Status != MeterActive {
+			return Price{}, Err(403, "METER_DISABLED", "this meter is disabled")
+		}
+		minor, err := p.discounted(ctx, tenant, plan, customerID, m.Currency, m.PriceMinor)
+		return Price{MeterID: m.ID, Currency: m.Currency, Minor: minor}, err
+	}
+	accts, err := p.Billing.Accounts(ctx, customerID)
+	if err != nil || len(accts) == 0 {
+		return Price{}, err
+	}
+	rate, err := p.Rate(ctx, tenant, plan, accts[0].Currency)
+	if err != nil {
+		var he interface{ Error() string }
+		if errors.As(err, &he) && strings.Contains(err.Error(), "no price is set") {
+			return Price{}, nil
+		}
+		return Price{}, err
+	}
+	minor, err := p.discounted(ctx, tenant, plan, customerID, accts[0].Currency, rate)
+	return Price{Currency: accts[0].Currency, Minor: minor}, err
+}
+
+// discounted applies the volume band for this month. A price of zero stays
+// zero, and a discount never takes a paid unit to zero.
+func (p *Pricing) discounted(ctx context.Context, tenant, plan, customerID, currency string, minor int64) (int64, error) {
+	if minor <= 0 {
+		return minor, nil
+	}
+	n, err := p.Billing.MonthUsage(ctx, customerID, p.Time())
+	if err != nil {
+		return 0, err
+	}
+	bps, err := p.DiscountBps(ctx, tenant, plan, currency, n)
+	if err != nil || bps == 0 {
+		return minor, err
+	}
+	out := minor - minor*int64(bps)/10000
+	if out < 1 {
+		out = 1
+	}
+	return out, nil
+}

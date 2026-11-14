@@ -1,0 +1,120 @@
+package billing
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"sort"
+	"time"
+
+)
+
+// InvoiceLine is one meter's share of a month.
+type InvoiceLine struct {
+	MeterID  string `json:"meterId"`
+	Scans      int64  `json:"units"`
+	GrossMinor int64  `json:"grossMinor"`
+}
+
+// Invoice is a calendar month's statement for one currency: what was charged
+// for verified units, what was returned, the tax on the net charge, and the
+// money paid in. It is computed from the ledger, so it can never disagree with it.
+type Invoice struct {
+	Number        string        `json:"number"`
+	CustomerID    string        `json:"customerId"`
+	Seller        string        `json:"seller,omitempty"`
+	SellerTaxID   string        `json:"sellerTaxId,omitempty"`
+	Month         string        `json:"month"` // 2026-11
+	From          string        `json:"from"`
+	To            string        `json:"to"`
+	Currency      string        `json:"currency"`
+	Scans         int64         `json:"units"` // charged and not refunded
+	GrossMinor    int64         `json:"grossMinor"`
+	RefundedMinor int64         `json:"refundedMinor"` // denied units returned
+	NetMinor      int64         `json:"netMinor"`
+	TaxBps        int           `json:"taxBps"`
+	TaxMinor      int64         `json:"taxMinor"`
+	TotalMinor    int64         `json:"totalMinor"`
+	PaidMinor     int64         `json:"paidMinor"`           // top-ups received in the month
+	RefundsMinor  int64         `json:"paymentRefundsMinor"` // payments returned to the business
+	AdjustMinor   int64         `json:"adjustMinor"`
+	OpeningMinor  int64         `json:"openingMinor"`
+	ClosingMinor  int64         `json:"closingMinor"`
+	ByMeter     []InvoiceLine `json:"byMeter"`
+}
+
+var monthRe = regexp.MustCompile(`^\d{4}-(0[1-9]|1[0-2])$`)
+
+// Invoice builds the statement for a month ("2026-11"; empty = the current month).
+func (s *Service) Invoice(ctx context.Context, customerID, currency, month string) (Invoice, error) {
+	if !validCurrency(currency) {
+		return Invoice{}, Err(400, "INVALID_CURRENCY", "currency must be a 3-letter code")
+	}
+	t := s.Time().UTC()
+	if month != "" {
+		if !monthRe.MatchString(month) {
+			return Invoice{}, Err(400, "INVALID_MONTH", "month must look like 2026-11")
+		}
+		var err error
+		if t, err = time.Parse("2006-01", month); err != nil {
+			return Invoice{}, Err(400, "INVALID_MONTH", "month must look like 2026-11")
+		}
+	}
+	from, to := monthBounds(t)
+	inv := Invoice{Number: fmt.Sprintf("INV-%s-%s-%s", customerID[max(0, len(customerID)-8):], t.Format("200601"), currency),
+		CustomerID: customerID, Seller: s.SellerName, SellerTaxID: s.SellerTaxID, Month: t.Format("2006-01"), From: from, To: to,
+		Currency: currency, TaxBps: s.TaxBps, ByMeter: []InvoiceLine{}}
+	var rows []Entry
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT id, customer_id, meter_id, currency, kind, amount_minor, balance_after, ref, created_at FROM billing_ledger
+		WHERE customer_id=? AND currency=? AND created_at >= ? AND created_at < ? ORDER BY created_at, rowid`, customerID, currency, from, to); err != nil {
+		return inv, err
+	}
+	by := map[string]*InvoiceLine{}
+	var net int64
+	for _, e := range rows {
+		net += e.AmountMinor
+		switch e.Kind {
+		case KindUsage:
+			inv.GrossMinor += -e.AmountMinor
+			inv.Scans++
+			l := by[e.MeterID]
+			if l == nil {
+				l = &InvoiceLine{MeterID: e.MeterID}
+				by[e.MeterID] = l
+			}
+			l.Scans++
+			l.GrossMinor += -e.AmountMinor
+		case KindRefund:
+			inv.RefundedMinor += e.AmountMinor
+			inv.Scans--
+			if l := by[e.MeterID]; l != nil {
+				l.Scans--
+				l.GrossMinor -= e.AmountMinor
+			}
+		case KindTopUp:
+			inv.PaidMinor += e.AmountMinor
+		case KindPayRefund:
+			inv.RefundsMinor += -e.AmountMinor
+		case KindAdjust:
+			inv.AdjustMinor += e.AmountMinor
+		}
+	}
+	inv.NetMinor = inv.GrossMinor - inv.RefundedMinor
+	inv.TaxMinor = inv.NetMinor * int64(inv.TaxBps) / 10000
+	inv.TotalMinor = inv.NetMinor + inv.TaxMinor
+	for _, l := range by {
+		inv.ByMeter = append(inv.ByMeter, *l)
+	}
+	sort.Slice(inv.ByMeter, func(i, j int) bool { return inv.ByMeter[i].MeterID < inv.ByMeter[j].MeterID })
+	// Balances: closing is the balance after the month's last row (or the
+	// balance after the latest earlier row); opening is closing less the month's movement.
+	var closing int64
+	if len(rows) > 0 {
+		closing = rows[len(rows)-1].BalanceAfter
+	} else {
+		_ = s.DB.GetContext(ctx, &closing, `SELECT COALESCE((SELECT balance_after FROM billing_ledger WHERE customer_id=? AND currency=? AND created_at < ? ORDER BY created_at DESC, rowid DESC LIMIT 1),0)`, customerID, currency, from)
+	}
+	inv.ClosingMinor = closing
+	inv.OpeningMinor = closing - net
+	return inv, nil
+}

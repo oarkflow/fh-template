@@ -1,0 +1,243 @@
+package payments
+
+import (
+	"context"
+	"errors"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/billing"
+	"github.com/oarkflow/squealx/drivers/sqlite"
+
+)
+
+const secret = "redir_0123456789abcdef0123456789abcdef0123456789ab"
+
+// This published Orgware return is also verified by Aura's payment-link
+// implementation. Keeping the cross-project vector here catches protocol
+// drift that a locally generated test signature could otherwise hide.
+func TestOrgwarePublishedAuraSignatureVector(t *testing.T) {
+	q := "app=acme-shop&orderId=ord_1793640000000001&status=completed&gateway=getpay&transactionId=d8b0b5d8e3ca41cbb686e435b435dbd0&sessionId=chk_5f0e7a7176bd1a0c5a2f3ef5df0dd290&amount=12500000&quantity=5&unitAmount=2500000&currency=NPR&reference=INV-1001&gatewayStatus=SUCCESS&gatewayMessage=SUCCESS&timestamp=1800000000&nonce=00112233445566778899aabbccddeeff&keyId=ab50f4e69a4c&signatureVersion=2&signatureAlgorithm=HMAC-SHA256&field_invoice=1001&field_note=hello+world+%26+thanks+~%2A%21%27%28%29+%C3%A9%2B%3D&signedFields=amount,app,currency,field_invoice,field_note,gateway,gatewayMessage,gatewayStatus,keyId,nonce,orderId,quantity,reference,sessionId,signatureAlgorithm,signatureVersion,status,timestamp,transactionId,unitAmount&signature=4f5bc000f290602ee39590ea3b5d1bbb7e5dfe275e7de47bab474171a9cdee5b"
+	g := &Orgware{cfg: Config{ReturnSecret: "redir_exampleSecret123", App: "acme-shop", MaxAge: 15 * time.Minute}}
+	r, err := g.Verify(q, time.Unix(1800000000, 0))
+	if err != nil {
+		t.Fatalf("Aura's published Orgware return must verify: %v", err)
+	}
+	if r.Reference != "INV-1001" || r.Status != "paid" || r.Currency != "NPR" || r.UnitMinor != 2500000 || r.Quantity != 5 || r.TotalMinor != 12500000 {
+		t.Fatalf("verified receipt = %+v", r)
+	}
+}
+
+func testConfig() Config {
+	return Config{Provider: "orgware", LinkURL: "https://orgware.store/pay/app-topup?app=app&success_url={redirect}&failure_url={redirect}&reference={ref}&quantity={quantity}",
+		ReturnURL: "https://app.example/pay/return", ReturnSecret: secret, App: "app", Currency: "NPR", UnitMinor: 50000, MinUnits: 1, MaxUnits: 20}.WithDefaults()
+}
+
+func newService(t *testing.T, cfg Config) (*Service, *billing.Service) {
+	t.Helper()
+	db, err := sqlite.Open("file:"+t.TempDir()+"/p.db?_pragma=busy_timeout(5000)", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	billing.ApplyMigration(t, db, "../mod/sql/0001_billing.sql")
+	deps := billing.Deps{DB: db, Audit: audit.New(db), Now: time.Now}
+	b := billing.New(deps)
+	gw, err := NewGateway(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(deps, cfg, gw, b), b
+}
+
+// signedReturn builds what the gateway redirects with, signed the way it does.
+func signedReturn(secretKey string, v map[string]string) string {
+	base := map[string]string{
+		"app": "app", "orderId": "gw_1", "status": "completed", "currency": "NPR", "transactionId": "tx1",
+		"timestamp": strconv.FormatInt(time.Now().Unix(), 10), "nonce": "00112233445566778899aabbccddeeff", "keyId": "k",
+		"signatureVersion": "2", "signatureAlgorithm": "HMAC-SHA256",
+	}
+	for k, x := range v {
+		base[k] = x
+	}
+	return SignReturn(secretKey, base)
+}
+
+func okReturn(ref string, units int64) string {
+	return signedReturn(secret, map[string]string{"reference": ref, "unitAmount": "50000", "quantity": strconv.FormatInt(units, 10), "amount": strconv.FormatInt(50000*units, 10)})
+}
+
+// The signature scheme of the Orgware payment-link service, against its published vector.
+func TestOrgwarePublishedVector(t *testing.T) {
+	q := "app=acme-shop&orderId=ord_1793640000000001&status=completed&gateway=getpay&transactionId=d8b0b5d8e3ca41cbb686e435b435dbd0&sessionId=chk_5f0e7a7176bd1a0c5a2f3ef5df0dd290&amount=12500000&quantity=5&unitAmount=2500000&currency=NPR&reference=INV-1001&gatewayStatus=SUCCESS&gatewayMessage=SUCCESS&timestamp=1800000000&nonce=00112233445566778899aabbccddeeff&keyId=ab50f4e69a4c&signatureVersion=2&signatureAlgorithm=HMAC-SHA256&field_invoice=1001&field_note=" +
+		url.QueryEscape("hello world & thanks ~*!'() é+=") +
+		"&signedFields=amount,app,currency,field_invoice,field_note,gateway,gatewayMessage,gatewayStatus,keyId,nonce,orderId,quantity,reference,sessionId,signatureAlgorithm,signatureVersion,status,timestamp,transactionId,unitAmount" +
+		"&signature=4f5bc000f290602ee39590ea3b5d1bbb7e5dfe275e7de47bab474171a9cdee5b"
+	at := time.Unix(1800000000, 0)
+	if _, ok := verifyOrgware("redir_exampleSecret123", q, at, 15*time.Minute); !ok {
+		t.Fatal("the published vector must verify")
+	}
+	for name, bad := range map[string]string{
+		"changed amount":    strings.Replace(q, "amount=12500000", "amount=1", 1),
+		"repeated field":    q + "&status=failed",
+		"another signature": strings.Replace(q, "signature=4f5b", "signature=0000", 1),
+	} {
+		if _, ok := verifyOrgware("redir_exampleSecret123", bad, at, 15*time.Minute); ok {
+			t.Fatalf("%s must fail", name)
+		}
+	}
+	if _, ok := verifyOrgware("redir_exampleSecret123", q+"&utm_source=x", at, 15*time.Minute); !ok {
+		t.Fatal("unsigned extras must not break a genuine redirect")
+	}
+	if _, ok := verifyOrgware("redir_exampleSecret123", q, at.Add(time.Hour), 15*time.Minute); ok {
+		t.Fatal("a stale redirect must fail")
+	}
+	if _, ok := verifyOrgware("redir_wrongSecret", q, at, 15*time.Minute); ok {
+		t.Fatal("a different secret must fail")
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	if err := (Config{}).Validate(true); err != nil {
+		t.Fatalf("off is valid: %v", err)
+	}
+	good := testConfig()
+	if err := good.Validate(true); err != nil {
+		t.Fatalf("good config: %v", err)
+	}
+	for name, mut := range map[string]func(*Config){
+		"unknown provider":        func(c *Config) { c.Provider = "paypal" },
+		"http link in production": func(c *Config) { c.LinkURL = "http://orgware.store/pay/x" },
+		"short secret":            func(c *Config) { c.ReturnSecret = "short" },
+		"no unit price":           func(c *Config) { c.UnitMinor = 0 },
+		"bad range":               func(c *Config) { c.MinUnits, c.MaxUnits = 5, 2 },
+	} {
+		c := good
+		mut(&c)
+		if err := c.Validate(true); err == nil {
+			t.Errorf("%s must be refused", name)
+		}
+	}
+}
+
+func TestStartBuildsLinkAndBoundsUnits(t *testing.T) {
+	s, _ := newService(t, testConfig())
+	if !s.Info().Available || s.Info().UnitMinor != 50000 {
+		t.Fatalf("info = %+v", s.Info())
+	}
+	co, err := s.Start(context.Background(), "t1", "m1", "acc1", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"https://orgware.store/pay/app-topup", "reference=" + co.OrderID, "quantity=3", "success_url=https%3A%2F%2Fapp.example%2Fpay%2Freturn"} {
+		if !strings.Contains(co.URL, want) {
+			t.Fatalf("link %q is missing %q", co.URL, want)
+		}
+	}
+	if co.AmountMinor != 150000 {
+		t.Fatalf("amount = %d", co.AmountMinor)
+	}
+	for _, n := range []int64{0, -1, 21} {
+		if _, err := s.Start(context.Background(), "t1", "m1", "acc1", n); err == nil {
+			t.Fatalf("%d packs must be refused", n)
+		}
+	}
+	off, _ := newService(t, Config{})
+	if off.Info().Available {
+		t.Fatal("no provider means no online payment")
+	}
+	if _, err := off.Start(context.Background(), "t1", "m1", "acc1", 1); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("disabled: %v", err)
+	}
+}
+
+func TestReturnCreditsOnceAndRejectsForgeries(t *testing.T) {
+	s, b := newService(t, testConfig())
+	ctx := context.Background()
+	co, _ := s.Start(ctx, "t1", "m1", "acc1", 2)
+
+	for name, q := range map[string]string{
+		"unsigned":       "?app=app&reference=" + co.OrderID + "&status=completed",
+		"wrong key":      signedReturn("redir_"+strings.Repeat("b", 48), map[string]string{"reference": co.OrderID, "unitAmount": "50000", "quantity": "2", "amount": "100000"}),
+		"another app":    signedReturn(secret, map[string]string{"app": "aura", "reference": co.OrderID, "unitAmount": "50000", "quantity": "2", "amount": "100000"}),
+		"cheaper rate":   signedReturn(secret, map[string]string{"reference": co.OrderID, "unitAmount": "100", "quantity": "2", "amount": "200"}),
+		"fewer packs":    signedReturn(secret, map[string]string{"reference": co.OrderID, "unitAmount": "50000", "quantity": "1", "amount": "50000"}),
+		"wrong total":    signedReturn(secret, map[string]string{"reference": co.OrderID, "unitAmount": "50000", "quantity": "2", "amount": "5"}),
+		"wrong currency": signedReturn(secret, map[string]string{"reference": co.OrderID, "unitAmount": "50000", "quantity": "2", "amount": "100000", "currency": "USD"}),
+		"unknown order":  okReturn("ord_nope", 2),
+	} {
+		if _, err := s.Complete(ctx, q); !errors.Is(err, ErrReturn) {
+			t.Errorf("%s: got %v, want ErrReturn", name, err)
+		}
+	}
+	if a, _ := b.Accounts(ctx, "m1"); len(a) != 0 {
+		t.Fatalf("a forged return opened an account or added money: %+v", a)
+	}
+
+	// A failed or pending payment adds nothing.
+	for _, st := range []string{"failed", "pending"} {
+		r, err := s.Complete(ctx, signedReturn(secret, map[string]string{"reference": co.OrderID, "unitAmount": "50000", "quantity": "2", "amount": "100000", "status": st}))
+		if err != nil || r.Status != st {
+			t.Fatalf("%s: %+v %v", st, r, err)
+		}
+	}
+	if a, _ := b.Accounts(ctx, "m1"); len(a) != 0 {
+		t.Fatal("an unpaid return must not credit")
+	}
+
+	// The genuine return credits the balance, opening the account if needed.
+	r, err := s.Complete(ctx, okReturn(co.OrderID, 2))
+	if err != nil || r.Status != "paid" {
+		t.Fatalf("paid: %+v %v", r, err)
+	}
+	a, _ := b.Accounts(ctx, "m1")
+	if len(a) != 1 || a[0].Balance != 100000 {
+		t.Fatalf("accounts = %+v", a)
+	}
+	// A refresh, a replay and a race add nothing more.
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = s.Complete(ctx, okReturn(co.OrderID, 2)) }()
+	}
+	wg.Wait()
+	if a, _ := b.Accounts(ctx, "m1"); a[0].Balance != 100000 {
+		t.Fatalf("credited more than once: %d", a[0].Balance)
+	}
+	orders, _ := s.Orders(ctx, "m1", 10)
+	if len(orders) != 1 || orders[0].Status != StatusPaid {
+		t.Fatalf("orders = %+v", orders)
+	}
+}
+
+func TestRacingReturnsOnAFreshOrderCreditOnce(t *testing.T) {
+	s, b := newService(t, testConfig())
+	ctx := context.Background()
+	co, _ := s.Start(ctx, "t1", "m1", "acc1", 1)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = s.Complete(ctx, okReturn(co.OrderID, 1)) }()
+	}
+	wg.Wait()
+	a, _ := b.Accounts(ctx, "m1")
+	if len(a) != 1 || a[0].Balance != 50000 {
+		t.Fatalf("racing returns: %+v", a)
+	}
+}
+
+func TestExpiredOrderIsRefused(t *testing.T) {
+	cfg := testConfig()
+	cfg.OrderLife = time.Millisecond
+	s, _ := newService(t, cfg)
+	co, _ := s.Start(context.Background(), "t1", "m1", "acc1", 1)
+	time.Sleep(1100 * time.Millisecond) // RFC 3339 has one-second resolution
+	if _, err := s.Complete(context.Background(), okReturn(co.OrderID, 1)); !errors.Is(err, ErrReturn) {
+		t.Fatalf("expired: %v", err)
+	}
+}

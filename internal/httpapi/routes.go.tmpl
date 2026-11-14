@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,8 @@ import (
 	appauth "__FH_MODULE__/internal/auth"
 	appconfig "__FH_MODULE__/internal/config"
 	appdb "__FH_MODULE__/internal/database"
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/enabled"
 	appsecurity "__FH_MODULE__/internal/security"
 	"github.com/oarkflow/authz"
 	"github.com/oarkflow/fh"
@@ -49,18 +52,20 @@ func Register(app *fh.App, cfg appconfig.Config, sessions *session.SessionManage
 		if !ok {
 			return c.JSON(fh.Map{"authenticated": false})
 		}
-		return c.JSON(fh.Map{"authenticated": true, "userID": principal.ID})
+		name, tenant := appauth.Details(c)
+		return c.JSON(fh.Map{"authenticated": true, "userID": principal.ID, "name": name, "tenant": tenant, "roles": principal.Roles})
 	}).Name("session-status").Tag("authentication")
 
 	app.Post("/auth/login", contract.New(contract.Config{Methods: []string{"POST"}, ContentTypes: []string{"application/json"}, MaxBodyBytes: 16 << 10}), func(c fh.Ctx) error {
 		if !sameOrigin(c, cfg.AllowedOrigins) {
 			return fh.NewHTTPError(fh.StatusForbidden, "ORIGIN_REJECTED", "same-origin login required")
 		}
-		user, password, err := appauth.DecodeLogin(c)
+		login, err := appauth.DecodeLogin(c)
 		if err != nil {
 			return err
 		}
-		if err := appauth.Login(c, sessions, store, user, password, cfg.LoginUser, cfg.LoginPassword, "admin"); err != nil {
+		user := login.Username
+		if err := appauth.Login(c, sessions, store, login, cfg.LoginUser, cfg.LoginPassword, "admin"); err != nil {
 			// A failed login is exactly the signal the brute-force/credential-
 			// stuffing detector needs; see security/policy/tcpguard.bcl's
 			// auth-brute-force rule. Ignore emission errors - anomaly
@@ -137,7 +142,10 @@ func Register(app *fh.App, cfg appconfig.Config, sessions *session.SessionManage
 		return c.JSON(fh.Map{"accepted": true, "body": body})
 	}).Name("echo").Tag("api")
 	registerNoteRoutes(api, store, engine, guard)
-	return nil
+	return modules.Setup(context.Background(), &modules.Deps{
+		App: app, API: api, Config: cfg, Store: store, DB: store.DB, Engine: engine, Guard: guard, Sessions: sessions,
+		SameOrigin: func(c fh.Ctx) bool { return sameOrigin(c, cfg.AllowedOrigins) },
+	}, enabled.All())
 }
 
 // registerNoteRoutes demonstrates the full stack together: squealx for a

@@ -1,0 +1,8 @@
+{
+  "name": "workflow",
+  "description": "BCL-defined multi-stage workflows on the ref pipeline engine: forms, stages, roles, routing, SLAs, reviews, notifications, versioned signed definitions and per-tenant form settings. Ships a sample 'request' workflow in config/workflows/.",
+  "requires": ["settings", "audit", "vault"],
+  "package": "internal/modules/workflow",
+  "gomod": { "require": { "github.com/oarkflow/ref": "v0.0.2-0.20261114013425-4b3ecc48865f" } },
+  "env": ["APP_WORKFLOW_DIR=config/workflows"]
+}

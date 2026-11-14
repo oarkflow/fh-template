@@ -1,0 +1,29 @@
+package billing
+
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/oarkflow/squealx"
+)
+
+// ApplyMigration runs a module SQL file (and the audit table it logs to) on db.
+func ApplyMigration(t *testing.T, db *squealx.DB, path string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := `CREATE TABLE IF NOT EXISTS audit_log (seq INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '', prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
+`
+	for _, stmt := range strings.Split(pre+string(raw), ";\n") {
+		if strings.TrimSpace(stmt) == "" {
+			continue
+		}
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			t.Fatalf("%v\n%s", err, stmt)
+		}
+	}
+}

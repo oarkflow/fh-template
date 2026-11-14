@@ -1,0 +1,806 @@
+package workflow
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"slices"
+
+	appauth "__FH_MODULE__/internal/auth"
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/settings"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/fh/mw/contract"
+	"github.com/oarkflow/ref/pipeline"
+)
+
+// Permissions the module enforces (resource:action), in addition to what the
+// BCL stage `roles` allow inside a case:
+//
+//	workflow:apply    open and work on your own case
+//	workflow:work     see the queue and work cases at the stages your roles allow
+//	workflow:approve  take approval actions
+//	workflow:manage   publish definitions and set per-tenant form settings
+var Permissions = []string{"workflow:apply", "workflow:work", "workflow:approve", "workflow:manage"}
+
+func jsonBody(max int) fh.HandlerFunc {
+	return contract.New(contract.Config{Methods: []string{"POST", "PUT"}, ContentTypes: []string{"application/json"}, MaxBodyBytes: max})
+}
+
+func bind(c fh.Ctx, v any) error {
+	if len(c.BodyCopy()) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(c.BodyCopy()))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_JSON", "request body is not valid for this endpoint")
+	}
+	return nil
+}
+
+func fieldDetails(fields []pipeline.FieldError) []map[string]string {
+	out := make([]map[string]string, 0, len(fields))
+	for _, f := range fields {
+		out = append(out, map[string]string{"path": f.Path, "rule": f.Rule, "message": f.Message})
+	}
+	return out
+}
+
+// wfFail maps workflow and pipeline errors to HTTP errors.
+func wfFail(err error) error {
+	var ve *pipeline.ValidationError
+	var he *fh.HTTPError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &he):
+		return he
+	case errors.As(err, &ve):
+		// Fields carry {path, rule, message} so a form can mark the right inputs.
+		return fh.NewHTTPError(fh.StatusUnprocessableEntity, "VALIDATION", ve.Error()).WithDetails(fieldDetails(ve.Fields))
+	case errors.Is(err, pipeline.ErrForbidden):
+		return fh.NewHTTPError(fh.StatusForbidden, "FORBIDDEN", err.Error())
+	case errors.Is(err, pipeline.ErrState):
+		return fh.NewHTTPError(fh.StatusConflict, "BAD_STATE", err.Error())
+	case errors.Is(err, pipeline.ErrConflict), errors.Is(err, ErrConflict):
+		return fh.NewHTTPError(fh.StatusConflict, "CONFLICT", "the case was changed by someone else; reload and retry")
+	case errors.Is(err, pipeline.ErrNotFound), errors.Is(err, ErrNotFound):
+		return fh.NewHTTPError(fh.StatusNotFound, "NOT_FOUND", "not found")
+	}
+	return fh.NewHTTPError(fh.StatusInternalServerError, "INTERNAL", "internal error")
+}
+
+type actBody struct {
+	Comment string         `json:"comment"`
+	Data    map[string]any `json:"data"`
+	// Acknowledgements are the page statements the person accepts on submit.
+	Acknowledgements pipeline.Acks `json:"acknowledgements"`
+	// Flags are the fields a reviewer sends back for correction ("form.input" -> why).
+	Flags map[string]string `json:"flags"`
+}
+
+// accountDirectory is what the module optionally uses from accounts / rbac.
+type stepUpper interface {
+	StepUpRequired(ctx context.Context, id string) bool
+	CheckStepUp(ctx context.Context, id, code string) bool
+}
+
+type effectiveRoles interface {
+	Effective(ctx context.Context, tenant, accountID, base string) []string
+}
+
+// host carries what handlers need.
+type host struct {
+	d   *modules.Deps
+	cfg *settings.Settings
+	svc *Service
+}
+
+func (h host) principal(c fh.Ctx) fh.Principal { p, _ := appauth.Principal(c); return p }
+func (h host) tenant(c fh.Ctx) string          { return h.cfg.Tenant(h.principal(c).TenantID) }
+
+// actor carries every role the caller holds (base, granted, inherited) so BCL
+// stage roles can name any of them.
+func (h host) actor(c fh.Ctx) pipeline.Actor {
+	p := h.principal(c)
+	tenant := h.tenant(c)
+	var roles []string
+	for _, base := range p.Roles {
+		if v, ok := h.d.Lookup("rbac"); ok {
+			if r, ok := v.(effectiveRoles); ok {
+				roles = append(roles, r.Effective(c.Context(), tenant, p.ID, base)...)
+				continue
+			}
+		}
+		roles = append(roles, expand(h.cfg, base)...)
+	}
+	return pipeline.Actor{ID: p.ID, Roles: dedupe(roles)}
+}
+
+// expand follows role inheritance from config/app.bcl.
+func expand(cfg *settings.Settings, role string) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(id string)
+	walk = func(id string) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+		if r, ok := cfg.Role(id); ok {
+			for _, p := range r.Inherits {
+				walk(p)
+			}
+		}
+	}
+	walk(role)
+	return out
+}
+
+func dedupe(in []string) []string {
+	slices.Sort(in)
+	return slices.Compact(in)
+}
+
+func (h host) stepUp(c fh.Ctx, code, what string) error {
+	p := h.principal(c)
+	if v, ok := h.d.Lookup("accounts"); ok {
+		if s, ok := v.(stepUpper); ok && s.StepUpRequired(c.Context(), p.ID) && !s.CheckStepUp(c.Context(), p.ID, code) {
+			return fh.NewHTTPError(fh.StatusForbidden, "STEP_UP_REQUIRED", "a fresh authenticator code is required to "+what)
+		}
+	}
+	return nil
+}
+
+// register mounts everything under /api/workflow.
+func register(d *modules.Deps, cfg *settings.Settings, svc *Service) {
+	h := host{d: d, cfg: cfg, svc: svc}
+	h.registerApplicant()
+	h.registerStaff()
+	h.registerAdmin()
+	h.registerInbox()
+	h.registerOperations()
+}
+
+func (h host) registerApplicant() {
+	svc, d := h.svc, h.d
+	// /api/workflow/:pipeline/me ... is the signed-in person's own case.
+	mine := d.API.Group("/workflow/:pipeline/me", d.Require("workflow:apply"))
+	engine := func(c fh.Ctx) (*pipeline.Engine, error) {
+		e, ok := svc.Engine(c.Param("pipeline"))
+		if !ok {
+			return nil, fh.NewHTTPError(fh.StatusNotFound, "PIPELINE_NOT_FOUND", "no such workflow")
+		}
+		return e, nil
+	}
+	applicant := func(c fh.Ctx) pipeline.Actor {
+		a := h.actor(c)
+		a.Roles = dedupe(append(a.Roles, svc.ApplicantRole))
+		return a
+	}
+	own := func(c fh.Ctx) (string, error) {
+		cs, err := svc.Current(c.Context(), c.Param("pipeline"), h.tenant(c), h.principal(c).ID)
+		if err != nil {
+			return "", wfFail(err)
+		}
+		return cs.ID, nil
+	}
+	view := func(c fh.Ctx, id string) error {
+		e, err := engine(c)
+		if err != nil {
+			return err
+		}
+		cs, err := svc.Get(c.Context(), id)
+		if err != nil {
+			return wfFail(err)
+		}
+		v, err := e.View(cs, applicant(c), "")
+		if err != nil {
+			return wfFail(err)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(v)
+	}
+	mine.Get("", func(c fh.Ctx) error {
+		id, err := own(c)
+		if err != nil {
+			return err
+		}
+		return view(c, id)
+	}).Name("workflow-me").Tag("workflow")
+
+	mine.Get("/appointments", func(c fh.Ctx) error {
+		id, err := own(c)
+		if err != nil {
+			return err
+		}
+		cs, err := svc.Get(c.Context(), id)
+		if err != nil {
+			return wfFail(err)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"appointments": svc.Appointments(cs)})
+	}).Name("workflow-me-appointments").Tag("workflow")
+
+	// choices narrows a dependent select from values typed but not saved yet:
+	// ?form=address&input=province&country=NP
+	mine.Get("/choices", func(c fh.Ctx) error {
+		e, err := engine(c)
+		if err != nil {
+			return err
+		}
+		id, err := own(c)
+		if err != nil {
+			return err
+		}
+		cs, err := svc.Get(c.Context(), id)
+		if err != nil {
+			return wfFail(err)
+		}
+		a := applicant(c)
+		v, err := e.View(cs, a, "")
+		if err != nil {
+			return wfFail(err)
+		}
+		form, input := c.Query("form"), c.Query("input")
+		deps := map[string]any{}
+		for _, g := range v.Page.Groups {
+			for _, f := range g.Forms {
+				if f.Name != form {
+					continue
+				}
+				for _, in := range f.Inputs {
+					if in.Name == input {
+						for _, dep := range in.DependsOn {
+							deps[dep] = c.Query(dep)
+						}
+					}
+				}
+			}
+		}
+		opts, err := e.Choices(cs, a, form, input, deps)
+		if err != nil {
+			return wfFail(err)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"choices": opts})
+	}).Name("workflow-me-choices").Tag("workflow")
+
+	mine.Put("/data", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in struct {
+			Stage string         `json:"stage"`
+			Data  map[string]any `json:"data"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		id, err := own(c)
+		if err != nil {
+			return err
+		}
+		if _, err := svc.Mutate(c.Context(), id, func(e *pipeline.Engine, cs *pipeline.Case) (*pipeline.Case, error) {
+			stage := in.Stage
+			if stage == "" {
+				stage = cs.Stage
+			}
+			return e.Save(c.Context(), cs, applicant(c), stage, in.Data)
+		}); err != nil {
+			return wfFail(err)
+		}
+		return view(c, id)
+	}).Name("workflow-me-save").Tag("workflow")
+
+	mine.Post("/actions/:action", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in actBody
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		id, err := own(c)
+		if err != nil {
+			return err
+		}
+		if _, err := svc.Mutate(c.Context(), id, func(e *pipeline.Engine, cs *pipeline.Case) (*pipeline.Case, error) {
+			return e.Act(c.Context(), cs, applicant(c), cs.Stage, c.Param("action"), pipeline.ActInput{Comment: in.Comment, Data: in.Data, Acknowledgements: in.Acknowledgements, Flags: in.Flags})
+		}); err != nil {
+			return wfFail(err)
+		}
+		return view(c, id)
+	}).Name("workflow-me-act").Tag("workflow")
+
+	// Start again once the last case has finished (carrying over what was entered).
+	mine.Post("/restart", jsonBody(1<<10), func(c fh.Ctx) error {
+		cs, err := svc.Restart(c.Context(), c.Param("pipeline"), h.tenant(c), h.principal(c).ID)
+		if err != nil {
+			return wfFail(err)
+		}
+		_ = svc.Audit.Append(c.Context(), h.principal(c).ID, "workflow.restart", cs.ID, map[string]any{"pipeline": c.Param("pipeline")})
+		return view(c, cs.ID)
+	}).Name("workflow-me-restart").Tag("workflow")
+
+	// A message to the people looking at your case (not marked internal).
+	mine.Post("/notes", jsonBody(8<<10), func(c fh.Ctx) error {
+		var in struct {
+			Body string `json:"body"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		id, err := own(c)
+		if err != nil {
+			return err
+		}
+		if _, err := svc.Mutate(c.Context(), id, func(e *pipeline.Engine, cs *pipeline.Case) (*pipeline.Case, error) {
+			return e.AddNote(c.Context(), cs, applicant(c), in.Body, false, "")
+		}); err != nil {
+			return wfFail(err)
+		}
+		return view(c, id)
+	}).Name("workflow-me-note").Tag("workflow")
+}
+
+func (h host) registerStaff() {
+	svc, d := h.svc, h.d
+	staff := d.API.Group("/workflow", d.Require("workflow:work"))
+	engineOf := func(cs *pipeline.Case) *pipeline.Engine { e, _ := svc.Engine(cs.Pipeline); return e }
+
+	// caseFor loads a case in the caller's tenant and audits the read.
+	caseFor := func(c fh.Ctx, event string) (*pipeline.Case, pipeline.Actor, error) {
+		cs, err := svc.Get(c.Context(), c.Param("id"))
+		if err != nil || cs.TenantID != h.tenant(c) {
+			return nil, pipeline.Actor{}, fh.NewHTTPError(fh.StatusNotFound, "CASE_NOT_FOUND", "case not found")
+		}
+		_ = svc.Audit.Append(c.Context(), h.principal(c).ID, event, cs.ID, nil)
+		return cs, h.actor(c), nil
+	}
+	staffView := func(c fh.Ctx, id string) error {
+		cs, err := svc.Get(c.Context(), id)
+		if err != nil {
+			return wfFail(err)
+		}
+		v, err := engineOf(cs).View(cs, h.actor(c), "")
+		c.Set("Cache-Control", "no-store")
+		if errors.Is(err, pipeline.ErrForbidden) {
+			// The case now waits at a stage this role does not work: show only where it is.
+			return c.JSON(fh.Map{"case": fh.Map{"id": cs.ID, "number": cs.Number, "status": cs.Status, "stage": cs.Stage}})
+		}
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(v)
+	}
+	mutate := func(c fh.Ctx, event string, fn func(*pipeline.Engine, *pipeline.Case, pipeline.Actor) (*pipeline.Case, error)) error {
+		cs, a, err := caseFor(c, event)
+		if err != nil {
+			return err
+		}
+		if _, err := svc.Mutate(c.Context(), cs.ID, func(e *pipeline.Engine, cur *pipeline.Case) (*pipeline.Case, error) {
+			return fn(e, cur, a)
+		}); err != nil {
+			return wfFail(err)
+		}
+		return staffView(c, cs.ID)
+	}
+	// approve gates approval actions on workflow:approve and the anomaly guard.
+	approve := func(c fh.Ctx) error {
+		if !d.Can(c, "workflow:approve") {
+			return fh.NewHTTPError(fh.StatusForbidden, "FORBIDDEN", "your role cannot do this")
+		}
+		if d.Guard != nil {
+			if blocked, err := d.Guard.EmitBusinessEvent(c, "workflow.approve", 0); err == nil && blocked {
+				return fh.NewHTTPError(fh.StatusTooManyRequests, "ANOMALY_DETECTED", "too many approvals too quickly")
+			}
+		}
+		return nil
+	}
+
+	staff.Get("", func(c fh.Ctx) error {
+		out := []fh.Map{}
+		for _, n := range svc.Names() {
+			dsc, err := svc.Describe(n)
+			if err != nil {
+				return wfFail(err)
+			}
+			out = append(out, fh.Map{"name": n, "title": dsc.Title})
+		}
+		return c.JSON(fh.Map{"workflows": out})
+	}).Name("workflow-list").Tag("workflow")
+
+	staff.Get("/:pipeline/queue", func(c fh.Ctx) error {
+		who := h.actor(c)
+		name := c.Param("pipeline")
+		e, ok := svc.Engine(name)
+		if !ok {
+			return fh.NewHTTPError(fh.StatusNotFound, "PIPELINE_NOT_FOUND", "no such workflow")
+		}
+		var stages []string
+		for _, st := range e.C.Def.Stages {
+			if !st.Public && who.HasAnyRole(st.Roles) {
+				stages = append(stages, st.Name)
+			}
+		}
+		if want := c.Query("stage"); want != "" {
+			if !slices.Contains(stages, want) {
+				return fh.NewHTTPError(fh.StatusForbidden, "FORBIDDEN", "your role does not work that stage")
+			}
+			stages = []string{want}
+		}
+		items, err := svc.Queue(c.Context(), name, h.tenant(c), stages, []string{pipeline.CaseInProgress, pipeline.CaseReturned}, 100)
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(fh.Map{"cases": items})
+	}).Name("workflow-queue").Tag("workflow")
+
+	staff.Get("/:pipeline/metrics", func(c fh.Ctx) error {
+		m, err := svc.Metrics(c.Context(), c.Param("pipeline"), h.tenant(c))
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(m)
+	}).Name("workflow-metrics").Tag("workflow")
+
+	staff.Get("/cases/:id", func(c fh.Ctx) error {
+		cs, _, err := caseFor(c, "workflow.view")
+		if err != nil {
+			return err
+		}
+		return staffView(c, cs.ID)
+	}).Name("workflow-case").Tag("workflow")
+
+	staff.Get("/cases/:id/notes", func(c fh.Ctx) error {
+		cs, a, err := caseFor(c, "workflow.notes")
+		if err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"notes": engineOf(cs).NotesFor(cs, a)})
+	}).Name("workflow-notes").Tag("workflow")
+
+	staff.Put("/cases/:id/data", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in struct {
+			Stage string         `json:"stage"`
+			Data  map[string]any `json:"data"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		return mutate(c, "workflow.save", func(e *pipeline.Engine, cs *pipeline.Case, a pipeline.Actor) (*pipeline.Case, error) {
+			stage := in.Stage
+			if stage == "" {
+				stage = cs.Stage
+			}
+			return e.Save(c.Context(), cs, a, stage, in.Data)
+		})
+	}).Name("workflow-save").Tag("workflow")
+
+	staff.Post("/cases/:id/actions/:action", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in actBody
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if c.Param("action") == "approve" {
+			if err := approve(c); err != nil {
+				return err
+			}
+		}
+		return mutate(c, "workflow.act", func(e *pipeline.Engine, cs *pipeline.Case, a pipeline.Actor) (*pipeline.Case, error) {
+			return e.Act(c.Context(), cs, a, cs.Stage, c.Param("action"), pipeline.ActInput{Comment: in.Comment, Data: in.Data, Acknowledgements: in.Acknowledgements, Flags: in.Flags})
+		})
+	}).Name("workflow-act").Tag("workflow")
+
+	staff.Post("/cases/:id/nodes/:node/:verb", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in struct {
+			Comment  string                           `json:"comment"`
+			Verdicts map[string]pipeline.VerdictInput `json:"verdicts"`
+			Result   map[string]any                   `json:"result"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if c.Param("verb") == "approve" {
+			if err := approve(c); err != nil {
+				return err
+			}
+		}
+		return mutate(c, "workflow.node", func(e *pipeline.Engine, cs *pipeline.Case, a pipeline.Actor) (*pipeline.Case, error) {
+			return e.NodeAct(c.Context(), cs, a, cs.Stage, c.Param("node"), c.Param("verb"),
+				pipeline.NodeInput{Comment: in.Comment, Verdicts: in.Verdicts, Result: in.Result})
+		})
+	}).Name("workflow-node").Tag("workflow")
+
+	staff.Post("/cases/:id/claim", func(c fh.Ctx) error {
+		return mutate(c, "workflow.claim", func(e *pipeline.Engine, cs *pipeline.Case, a pipeline.Actor) (*pipeline.Case, error) {
+			return e.Claim(c.Context(), cs, a, cs.Stage)
+		})
+	}).Name("workflow-claim").Tag("workflow")
+
+	staff.Post("/cases/:id/suspend", jsonBody(4<<10), func(c fh.Ctx) error {
+		var in actBody
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		return mutate(c, "workflow.suspend", func(e *pipeline.Engine, cs *pipeline.Case, a pipeline.Actor) (*pipeline.Case, error) {
+			return e.Suspend(c.Context(), cs, a, cs.Stage, in.Comment, nil)
+		})
+	}).Name("workflow-suspend").Tag("workflow")
+
+	staff.Post("/cases/:id/resume", jsonBody(4<<10), func(c fh.Ctx) error {
+		var in actBody
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		return mutate(c, "workflow.resume", func(e *pipeline.Engine, cs *pipeline.Case, a pipeline.Actor) (*pipeline.Case, error) {
+			return e.Resume(c.Context(), cs, a, cs.Stage, in.Comment)
+		})
+	}).Name("workflow-resume").Tag("workflow")
+
+	staff.Post("/cases/:id/notes", jsonBody(8<<10), func(c fh.Ctx) error {
+		var in struct {
+			Body     string `json:"body"`
+			Internal bool   `json:"internal"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		return mutate(c, "workflow.note", func(e *pipeline.Engine, cs *pipeline.Case, a pipeline.Actor) (*pipeline.Case, error) {
+			return e.AddNote(c.Context(), cs, a, in.Body, in.Internal, "")
+		})
+	}).Name("workflow-add-note").Tag("workflow")
+}
+
+// registerAdmin: definitions (shared by every tenant, so only the home tenant
+// may change them) and per-tenant form settings (which can only tighten).
+func (h host) registerAdmin() {
+	svc, d := h.svc, h.d
+	operator := func(c fh.Ctx) bool { return h.tenant(c) == h.cfg.Tenancy.Default }
+	atoi := func(s string) (int, bool) {
+		n := 0
+		if s == "" {
+			return 0, false
+		}
+		for _, ch := range s {
+			if ch < '0' || ch > '9' {
+				return 0, false
+			}
+			n = n*10 + int(ch-'0')
+		}
+		return n, true
+	}
+	problems := func(c fh.Ctx, code string, list []string) error {
+		return c.Status(fh.StatusUnprocessableEntity).JSON(fh.Map{"code": code, "problems": list})
+	}
+
+	w := d.API.Group("/admin/workflows", d.Require("workflow:manage"))
+	guardPublish := func(c fh.Ctx, code string) error {
+		if !operator(c) {
+			return fh.NewHTTPError(fh.StatusForbidden, "OPERATOR_ONLY", "workflow definitions are shared by every tenant; only the operator's tenant can publish them")
+		}
+		return h.stepUp(c, code, "publish a workflow")
+	}
+	w.Get("", func(c fh.Ctx) error {
+		running := svc.Running(c.Context())
+		list := []fh.Map{}
+		for _, n := range svc.Names() {
+			dsc, err := svc.Describe(n)
+			if err != nil {
+				return wfFail(err)
+			}
+			list = append(list, fh.Map{"name": n, "title": dsc.Title, "version": running[n]})
+		}
+		return c.JSON(fh.Map{"workflows": list, "canPublish": operator(c)})
+	}).Name("workflows-list").Tag("admin")
+
+	w.Get("/:name", func(c fh.Ctx) error {
+		src, err := svc.Source(c.Context(), c.Param("name"), 0)
+		if err != nil {
+			return wfFail(err)
+		}
+		revs, err := svc.Definitions(c.Context(), c.Param("name"))
+		if err != nil {
+			return wfFail(err)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"source": src, "revisions": revs, "version": svc.Running(c.Context())[c.Param("name")], "canPublish": operator(c)})
+	}).Name("workflow-get").Tag("admin")
+
+	w.Get("/:name/versions/:version", func(c fh.Ctx) error {
+		v, ok := atoi(c.Param("version"))
+		if !ok {
+			return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_VERSION", "version must be a number")
+		}
+		src, err := svc.Source(c.Context(), c.Param("name"), v)
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(fh.Map{"source": src})
+	}).Name("workflow-version").Tag("admin")
+
+	w.Post("/:name/check", jsonBody(600<<10), func(c fh.Ctx) error {
+		var in struct {
+			Source string `json:"source"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"problems": svc.CheckDefinition(c.Context(), c.Param("name"), in.Source)})
+	}).Name("workflow-check").Tag("admin")
+
+	w.Post("/:name/publish", jsonBody(600<<10), func(c fh.Ctx) error {
+		var in struct {
+			Source string `json:"source"`
+			Note   string `json:"note"`
+			StepUp string `json:"totp"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := guardPublish(c, in.StepUp); err != nil {
+			return err
+		}
+		v, list, err := svc.Publish(c.Context(), h.principal(c).ID, c.Param("name"), in.Source, in.Note)
+		if err != nil {
+			if len(list) > 0 {
+				return problems(c, "INVALID_DEFINITION", list)
+			}
+			return wfFail(err)
+		}
+		return c.Status(fh.StatusCreated).JSON(fh.Map{"version": v})
+	}).Name("workflow-publish").Tag("admin")
+
+	w.Post("/:name/restore", jsonBody(1<<10), func(c fh.Ctx) error {
+		var in struct {
+			Version int    `json:"version"`
+			StepUp  string `json:"totp"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := guardPublish(c, in.StepUp); err != nil {
+			return err
+		}
+		v, list, err := svc.RestoreDefinition(c.Context(), h.principal(c).ID, c.Param("name"), in.Version)
+		if err != nil {
+			if len(list) > 0 {
+				return problems(c, "INVALID_DEFINITION", list)
+			}
+			return wfFail(err)
+		}
+		return c.Status(fh.StatusCreated).JSON(fh.Map{"version": v})
+	}).Name("workflow-restore").Tag("admin")
+
+	f := d.API.Group("/admin/forms", d.Require("workflow:manage"))
+	f.Get("", func(c fh.Ctx) error {
+		return c.JSON(fh.Map{"workflows": svc.Pipelines()})
+	}).Name("forms-list").Tag("admin")
+
+	f.Get("/:name", func(c fh.Ctx) error {
+		dsc, err := svc.Describe(c.Param("name"))
+		if err != nil {
+			return wfFail(err)
+		}
+		ov, rev, err := svc.Overrides(c.Context(), h.tenant(c), c.Param("name"))
+		if err != nil {
+			return wfFail(err)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"workflow": dsc, "settings": ov, "rev": rev})
+	}).Name("forms-get").Tag("admin")
+
+	f.Post("/:name/check", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in struct {
+			Settings *pipeline.Overrides `json:"settings"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		list, err := svc.CheckOverrides(c.Param("name"), in.Settings)
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(fh.Map{"problems": list})
+	}).Name("forms-check").Tag("admin")
+
+	f.Post("/:name/preview", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in struct {
+			Settings *pipeline.Overrides `json:"settings"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		v, list, err := svc.Preview(c.Context(), h.tenant(c), c.Param("name"), in.Settings)
+		if err != nil {
+			return wfFail(err)
+		}
+		if len(list) > 0 {
+			return problems(c, "INVALID_FORM_SETTINGS", list)
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(v)
+	}).Name("forms-preview").Tag("admin")
+
+	f.Put("/:name", jsonBody(64<<10), func(c fh.Ctx) error {
+		var in struct {
+			Settings *pipeline.Overrides `json:"settings"`
+			Note     string              `json:"note"`
+			StepUp   string              `json:"totp"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := h.stepUp(c, in.StepUp, "change form settings"); err != nil {
+			return err
+		}
+		rev, list, err := svc.SetOverrides(c.Context(), h.principal(c).ID, h.tenant(c), c.Param("name"), in.Settings, in.Note)
+		if err != nil {
+			if len(list) > 0 {
+				return problems(c, "INVALID_FORM_SETTINGS", list)
+			}
+			return wfFail(err)
+		}
+		return c.JSON(fh.Map{"rev": rev})
+	}).Name("forms-put").Tag("admin")
+
+	f.Get("/:name/history", func(c fh.Ctx) error {
+		out, err := svc.OverrideHistory(c.Context(), h.tenant(c), c.Param("name"))
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(fh.Map{"revisions": out})
+	}).Name("forms-history").Tag("admin")
+
+	f.Post("/:name/rollback", jsonBody(1<<10), func(c fh.Ctx) error {
+		var in struct {
+			Rev    int    `json:"rev"`
+			StepUp string `json:"totp"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := h.stepUp(c, in.StepUp, "change form settings"); err != nil {
+			return err
+		}
+		rev, err := svc.RollbackOverrides(c.Context(), h.principal(c).ID, h.tenant(c), c.Param("name"), in.Rev)
+		if err != nil {
+			return wfFail(err)
+		}
+		return c.JSON(fh.Map{"rev": rev})
+	}).Name("forms-rollback").Tag("admin")
+}
+
+// registerInbox: the in-app notification inbox.
+func (h host) registerInbox() {
+	svc, d := h.svc, h.d
+	d.API.Get("/notifications", func(c fh.Ctx) error {
+		var rows []struct {
+			ID        string `db:"id" json:"id"`
+			Kind      string `db:"kind" json:"kind"`
+			Body      string `db:"body" json:"body"`
+			CreatedAt string `db:"created_at" json:"createdAt"`
+			ReadAt    string `db:"read_at" json:"readAt"`
+		}
+		if err := svc.DB.SelectContext(c.Context(), &rows, `SELECT id, kind, body, created_at, read_at FROM notifications WHERE account_id=? ORDER BY created_at DESC LIMIT 100`, h.principal(c).ID); err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "NOTIFICATIONS_FAILED", "could not read notifications")
+		}
+		if rows == nil {
+			rows = []struct {
+				ID        string `db:"id" json:"id"`
+				Kind      string `db:"kind" json:"kind"`
+				Body      string `db:"body" json:"body"`
+				CreatedAt string `db:"created_at" json:"createdAt"`
+				ReadAt    string `db:"read_at" json:"readAt"`
+			}{}
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"notifications": rows})
+	}).Name("notifications").Tag("workflow")
+
+	d.API.Post("/notifications/:id/read", func(c fh.Ctx) error {
+		_, err := svc.DB.ExecContext(c.Context(), `UPDATE notifications SET read_at=? WHERE id=? AND account_id=? AND read_at=''`, svc.Stamp(), c.Param("id"), h.principal(c).ID)
+		if err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "NOTIFICATIONS_FAILED", "could not update the notification")
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("notification-read").Tag("workflow")
+}

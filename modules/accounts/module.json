@@ -1,0 +1,14 @@
+{
+  "name": "accounts",
+  "description": "Accounts and login driven by BCL datasources (builtin table, static users, or your own SQL user table): argon2id/bcrypt, lockout, TOTP, OTP-verified self-registration, account management API.",
+  "requires": ["settings", "audit", "vault"],
+  "package": "internal/modules/accounts",
+  "env": [
+    "# accounts module: optional first administrator for the builtin datasource",
+    "APP_BOOTSTRAP_EMAIL=",
+    "APP_BOOTSTRAP_PASSWORD=",
+    "# optional delivery gateway for OTP messages (POST JSON). Required in production if registration is enabled.",
+    "APP_NOTIFY_URL=",
+    "APP_NOTIFY_TOKEN="
+  ]
+}

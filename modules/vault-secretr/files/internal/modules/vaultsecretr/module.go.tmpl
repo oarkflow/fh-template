@@ -1,0 +1,27 @@
+// Package vaultsecretr is a vault KMS backend whose key-encryption and
+// blind-index keys live in a github.com/oarkflow/secretr encrypted store. Enable
+// it with `vault { backend "secretr" }` in config/app.bcl.
+package vaultsecretr
+
+import (
+	"context"
+	"io/fs"
+
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/vault"
+)
+
+func init() {
+	vault.RegisterBackend("secretr", func(dir string, masterKey []byte) (vault.KMS, error) {
+		return Open(dir, masterKey)
+	})
+}
+
+type module struct{}
+
+// Module returns the module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string                                    { return "vault-secretr" }
+func (module) Migrations() fs.FS                               { return nil }
+func (module) Register(context.Context, *modules.Deps) error { return nil }

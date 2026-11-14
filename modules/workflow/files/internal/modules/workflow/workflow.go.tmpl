@@ -1,0 +1,141 @@
+// Package workflow loads BCL pipeline definitions (forms, stages, roles) and
+// runs them on the ref pipeline engine.
+package workflow
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+
+	"github.com/oarkflow/bcl"
+	"github.com/oarkflow/ref/pipeline"
+	"github.com/oarkflow/ref/platform"
+)
+
+type document struct {
+	Pipelines []pipeline.Definition `bcl:"pipeline,block"`
+	Lookups   []lookupDef           `bcl:"lookup,block"`
+}
+
+type lookupDef struct {
+	Name    string        `bcl:",id"`
+	Entries []lookupEntry `bcl:"entry,block"`
+}
+
+type lookupEntry struct {
+	Code     string `bcl:"code"`
+	Label    string `bcl:"label"`
+	Parent   string `bcl:"parent"`
+	Disabled bool   `bcl:"disabled"`
+}
+
+// Lookups holds reference data for select inputs, defined in BCL.
+type Lookups map[string][]lookupEntry
+
+// Options lists a set's entries, narrowed to those under one of the parents
+// when given (dependent selects). Entries with no parent always match.
+func (l Lookups) Options(set string, parents ...string) []pipeline.Option {
+	var out []pipeline.Option
+	for _, e := range l[set] {
+		if e.Disabled {
+			continue
+		}
+		if len(parents) > 0 && e.Parent != "" && !slices.Contains(parents, e.Parent) {
+			continue
+		}
+		out = append(out, pipeline.Option{Value: e.Code, Label: e.Label})
+	}
+	return out
+}
+
+// Set is everything loaded from a workflow directory.
+type Set struct {
+	Pipelines map[string]*pipeline.Compiled
+	Lookups   Lookups
+	// Sources is the BCL text each pipeline was compiled from, so an administrator
+	// can read the running definition and publish a changed copy.
+	Sources map[string]string
+}
+
+// Load compiles every *.bcl file in dir: pipelines (forms, stages, roles) and
+// lookup sets.
+func Load(dir string) (*Set, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "*.bcl"))
+	if err != nil {
+		return nil, err
+	}
+	set := &Set{Pipelines: map[string]*pipeline.Compiled{}, Lookups: Lookups{}, Sources: map[string]string{}}
+	for _, f := range files {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		var doc document
+		if err := bcl.UnmarshalWithOptions(src, &doc, &bcl.Options{BaseDir: dir}); err != nil {
+			return nil, fmt.Errorf("workflow %s: %w", filepath.Base(f), err)
+		}
+		for _, l := range doc.Lookups {
+			set.Lookups[l.Name] = append(set.Lookups[l.Name], l.Entries...)
+		}
+		for i := range doc.Pipelines {
+			c, err := pipeline.Compile(&doc.Pipelines[i])
+			if err != nil {
+				return nil, fmt.Errorf("workflow %s: %w", filepath.Base(f), err)
+			}
+			set.Pipelines[doc.Pipelines[i].Name] = c
+			set.Sources[doc.Pipelines[i].Name] = string(src)
+		}
+	}
+	return set, nil
+}
+
+// LoadDir returns just the compiled pipelines of a directory.
+func LoadDir(dir string) (map[string]*pipeline.Compiled, error) {
+	set, err := Load(dir)
+	if err != nil {
+		return nil, err
+	}
+	return set.Pipelines, nil
+}
+
+// evaluator runs pipeline expressions (visible_if, required_if, assign,
+// compute) in the platform expression language, compiling each once.
+type evaluator struct{ cache sync.Map }
+
+func (ev *evaluator) Eval(expr string, env map[string]any) (any, error) {
+	compiled, ok := ev.cache.Load(expr)
+	if !ok {
+		c, err := platform.CompileExpr(expr)
+		if err != nil {
+			return nil, err
+		}
+		compiled, _ = ev.cache.LoadOrStore(expr, c)
+	}
+	return compiled.(*platform.Expression).Eval(platform.Env(env))
+}
+
+// NewEngine returns a ready engine for a compiled pipeline. signingKey signs
+// certificates and external links.
+func NewEngine(c *pipeline.Compiled, signingKey []byte, lookups Lookups) *pipeline.Engine {
+	e := pipeline.NewEngine(c)
+	e.Eval = &evaluator{}
+	e.SigningKey = signingKey
+	if lookups != nil {
+		e.Lookup = func(set string, _ *pipeline.Case) []pipeline.Option { return lookups.Options(set) }
+		e.LookupFor = func(set string, _ *pipeline.Case, deps map[string]any) []pipeline.Option {
+			var parents []string
+			for _, v := range deps {
+				if s, ok := v.(string); ok && s != "" {
+					parents = append(parents, s)
+				}
+			}
+			if len(parents) == 0 {
+				return nil // nothing chosen yet: nothing to offer
+			}
+			return lookups.Options(set, parents...)
+		}
+	}
+	return e
+}

@@ -1,0 +1,26 @@
+package objects
+
+import "testing"
+
+func TestFSRoundTripAndTraversal(t *testing.T) {
+	f := FS{Root: t.TempDir()}
+	if err := f.Put("docs/s1/d1.bin", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := f.Get("docs/s1/d1.bin"); err != nil || string(b) != "x" {
+		t.Fatalf("%q %v", b, err)
+	}
+	for _, bad := range []string{"../etc/passwd", "/abs", "a/../../b", "a//b", ""} {
+		if f.Put(bad, []byte("x")) == nil {
+			t.Errorf("accepted key %q", bad)
+		}
+	}
+	f.Put("live/s1/a", []byte("1"))
+	f.Put("live/s1/b", []byte("2"))
+	if n, err := f.DeletePrefix("live/s1/"); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if _, err := f.Get("live/s1/a"); err != ErrNotFound {
+		t.Fatalf("want not found, got %v", err)
+	}
+}

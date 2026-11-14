@@ -1,0 +1,16 @@
+{
+  "name": "vault-secretr",
+  "description": "secretr-backed KMS for the vault module: key-encryption and blind-index keys live in an encrypted secretr store, selected with vault { backend \"secretr\" }. Needs access to the (private) github.com/oarkflow/secretr module.",
+  "requires": [
+    "vault"
+  ],
+  "package": "internal/modules/vaultsecretr",
+  "gomod": {
+    "require": {
+      "github.com/oarkflow/secretr": "v1.1.1-0.20261112154101-d5af7dcc6e6e"
+    }
+  },
+  "env": [
+    "# vault-secretr: needs APP_VAULT_KEY (the store's master key); keys live under vault.dir in config/app.bcl"
+  ]
+}

@@ -1,0 +1,76 @@
+package billing
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"__FH_MODULE__/internal/modules/audit"
+	"github.com/oarkflow/squealx/drivers/sqlite"
+)
+
+func newPricing(t *testing.T) (*Pricing, *Service) {
+	t.Helper()
+	db, err := sqlite.Open("file:"+t.TempDir()+"/p.db?_pragma=busy_timeout(5000)", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ApplyMigration(t, db, "mod/sql/0001_billing.sql")
+	d := Deps{DB: db, Audit: audit.New(db), Now: time.Now}
+	b := New(d)
+	return NewPricing(d, b), b
+}
+
+func TestPriceFromRateCardMeterAndVolumeTier(t *testing.T) {
+	p, b := newPricing(t)
+	ctx := context.Background()
+	if err := p.SetRate(ctx, "adm", "t1", "pro", "USD", 1000); err != nil {
+		t.Fatal(err)
+	}
+	// No billing account yet: nothing is charged.
+	if got, err := p.PriceFor(ctx, "t1", "pro", "c1", ""); err != nil || got.Minor != 0 {
+		t.Fatalf("no account = %+v %v", got, err)
+	}
+	if err := b.OpenAccount(ctx, "adm", "c1", "USD", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := p.PriceFor(ctx, "t1", "pro", "c1", ""); got.Minor != 1000 || got.Currency != "USD" {
+		t.Fatalf("rate card price = %+v", got)
+	}
+	// A plan with no rate is free rather than an error.
+	if got, err := p.PriceFor(ctx, "t1", "free", "c1", ""); err != nil || got.Minor != 0 {
+		t.Fatalf("no rate = %+v %v", got, err)
+	}
+	m, err := p.RegisterMeter(ctx, "adm", "t1", "pro", "c1", "Gate 1", "USD")
+	if err != nil || m.PriceMinor != 1000 {
+		t.Fatalf("meter = %+v %v", m, err)
+	}
+	if err := p.SetMeterPrice(ctx, "adm", m.ID, 400); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := p.PriceFor(ctx, "t1", "pro", "c1", m.ID); got.Minor != 400 || got.MeterID != m.ID {
+		t.Fatalf("meter price = %+v", got)
+	}
+	// 50% off from the 3rd unit this month.
+	if err := p.SetTier(ctx, "adm", "t1", Tier{Plan: "pro", Currency: "USD", FromUnits: 3, DiscountBps: 5000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.TopUp(ctx, "adm", "c1", "USD", 100000, "pay-1"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := b.Charge(ctx, "c1", Price{Currency: "USD", Minor: 1000}, "u"+string(rune('a'+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := p.PriceFor(ctx, "t1", "pro", "c1", ""); got.Minor != 500 {
+		t.Fatalf("discounted price = %+v", got)
+	}
+	if err := p.DisableMeter(ctx, "adm", "c1", m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.PriceFor(ctx, "t1", "pro", "c1", m.ID); err == nil {
+		t.Fatal("a disabled meter was priced")
+	}
+}

@@ -1,0 +1,6 @@
+{
+  "name": "rbac",
+  "description": "Editable, tenant-aware role-based access control. Roles come from config/app.bcl as defaults, then live in the database with history, rollback, anti-escalation and an admin API (/api/rbac). Becomes the authorizer for every module.",
+  "requires": ["settings", "audit"],
+  "package": "internal/modules/rbac"
+}

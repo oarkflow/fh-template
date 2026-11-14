@@ -1,0 +1,186 @@
+package workflow
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/vault"
+	"github.com/oarkflow/ref/pipeline"
+	"github.com/oarkflow/squealx"
+	"github.com/oarkflow/squealx/drivers/sqlite"
+)
+
+var (
+	person   = pipeline.Actor{ID: "u1", Roles: []string{"applicant"}}
+	editor   = pipeline.Actor{ID: "e1", Roles: []string{"editor"}}
+	approver = pipeline.Actor{ID: "a1", Roles: []string{"admin"}}
+)
+
+// The sample definitions ship in config/workflows; the package sits three levels down.
+const sampleDir = "../../../config/workflows"
+
+func request() map[string]any {
+	return map[string]any{"request": map[string]any{"title": "Laptop", "category": "purchase", "details": "A new laptop for the team"}}
+}
+
+func TestSampleWorkflowCompiles(t *testing.T) {
+	set, err := Load(sampleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := set.Pipelines["request"]; !ok || len(set.Sources["request"]) == 0 {
+		t.Fatalf("sample workflow 'request' missing: %v", set.Pipelines)
+	}
+}
+
+func TestEngineFlowAndFourEyes(t *testing.T) {
+	set, err := Load(sampleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewEngine(set.Pipelines["request"], []byte("test-signing-key-0123456789abcdef"), set.Lookups)
+	ctx := context.Background()
+	c, err := e.Start(ctx, person, pipeline.StartOptions{ID: "case1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err = e.Save(ctx, c, person, "application", request()); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if c, err = e.Act(ctx, c, person, "application", "submit", pipeline.ActInput{Acknowledgements: pipeline.Acks{"consent": ""}}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if c.Stage != "review" {
+		t.Fatalf("stage = %s", c.Stage)
+	}
+	if _, err = e.Act(ctx, c, person, "review", "accept", pipeline.ActInput{}); err == nil {
+		t.Fatal("the applicant must not review their own request")
+	}
+	// Return for more information, then resubmit.
+	if c, err = e.Act(ctx, c, editor, "review", "return", pipeline.ActInput{Comment: "add the budget"}); err != nil {
+		t.Fatalf("return: %v", err)
+	}
+	if c.Stage != "application" {
+		t.Fatalf("returned stage = %s", c.Stage)
+	}
+	if c, err = e.Act(ctx, c, person, "application", "submit", pipeline.ActInput{Acknowledgements: pipeline.Acks{"consent": ""}}); err != nil {
+		t.Fatalf("resubmit: %v", err)
+	}
+	if c, err = e.Act(ctx, c, editor, "review", "accept", pipeline.ActInput{}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if c.Stage != "approval" {
+		t.Fatalf("stage = %s", c.Stage)
+	}
+	if _, err = e.NodeAct(ctx, c, editor, "approval", "sign_off", "approve", pipeline.NodeInput{}); err == nil {
+		t.Fatal("an editor must not approve")
+	}
+	if c, err = e.NodeAct(ctx, c, approver, "approval", "sign_off", "approve", pipeline.NodeInput{}); err != nil {
+		t.Fatalf("approve node: %v", err)
+	}
+	if c, err = e.Act(ctx, c, approver, "approval", "approve", pipeline.ActInput{}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if c.Status != pipeline.CaseCompleted && c.Status != pipeline.CaseApproved {
+		t.Fatalf("final status = %s", c.Status)
+	}
+}
+
+func newService(t *testing.T) (*Service, *squealx.DB) {
+	t.Helper()
+	db, err := sqlite.Open("file:"+t.TempDir()+"/w.db?_pragma=busy_timeout(5000)", "w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	raw, _ := migrations.ReadFile("sql/0001_workflow.sql")
+	for _, stmt := range strings.Split(string(raw), ";\n") {
+		if strings.TrimSpace(stmt) != "" {
+			if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+				t.Fatalf("%v\n%s", err, stmt)
+			}
+		}
+	}
+	for _, q := range []string{
+		`CREATE TABLE key_store (subject_id TEXT PRIMARY KEY, version TEXT NOT NULL, blob BLOB NOT NULL, created_at TEXT NOT NULL)`,
+		`CREATE TABLE audit_log (seq INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '', prev_hash TEXT NOT NULL, hash TEXT NOT NULL)`,
+	} {
+		if _, err := db.ExecContext(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set, err := Load(sampleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Deps{DB: db, Vault: vault.New(vault.RandomMemoryKMS(), vault.DBKeyStore{DB: db}), Audit: audit.New(db)}
+	return New(d, set, []byte("test-signing-key-0123456789abcdef")), db
+}
+
+func TestServicePersistsCasesEncryptedAndScopedByTenant(t *testing.T) {
+	s, db := newService(t)
+	ctx := context.Background()
+	c, err := s.Start(ctx, "request", "t1", "acct1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(c.Number, "REQ-") {
+		t.Fatalf("number = %q", c.Number)
+	}
+	if _, err := s.Mutate(ctx, c.ID, func(e *pipeline.Engine, cs *pipeline.Case) (*pipeline.Case, error) {
+		return e.Save(ctx, cs, pipeline.Actor{ID: "acct1", Roles: []string{"applicant"}}, "application", request())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var sealed string
+	if err := db.GetContext(ctx, &sealed, `SELECT body_enc FROM workflow_cases WHERE id=?`, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sealed, "Laptop") || strings.Contains(sealed, "laptop") {
+		t.Fatal("case data is stored in the clear")
+	}
+	got, err := s.Get(ctx, c.ID)
+	if err != nil || got.TenantID != "t1" {
+		t.Fatalf("get = %+v %v", got, err)
+	}
+	// One open case per subject and pipeline.
+	again, err := s.Start(ctx, "request", "t1", "acct1")
+	if err != nil || again.ID != c.ID {
+		t.Fatalf("a second open case was created: %v %v", again, err)
+	}
+	items, err := s.Queue(ctx, "request", "t2", []string{"application"}, []string{pipeline.CaseInProgress}, 10)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("another tenant sees %d cases (%v)", len(items), err)
+	}
+}
+
+func TestPublishedDefinitionIsSignedVersionedAndRestorable(t *testing.T) {
+	s, _ := newService(t)
+	ctx := context.Background()
+	src, err := s.Source(ctx, "request", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems := s.CheckDefinition(ctx, "request", "pipeline \"request\" {"); len(problems) == 0 {
+		t.Fatal("a broken definition was accepted")
+	}
+	if _, _, err := s.Publish(ctx, "adm", "request", src, ""); err == nil {
+		t.Fatal("publishing without a note must fail")
+	}
+	v, problems, err := s.Publish(ctx, "adm", "request", strings.Replace(src, `title "Request"`, `title "Service request"`, 1), "rename")
+	if err != nil || len(problems) > 0 {
+		t.Fatalf("publish: %v %v", err, problems)
+	}
+	if d, _ := s.Describe("request"); d.Title != "Service request" {
+		t.Fatalf("title = %q", d.Title)
+	}
+	revs, _ := s.Definitions(ctx, "request")
+	if len(revs) == 0 || !revs[0].Verified {
+		t.Fatalf("revisions = %+v", revs)
+	}
+	if _, _, err := s.RestoreDefinition(ctx, "adm", "request", v); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+}

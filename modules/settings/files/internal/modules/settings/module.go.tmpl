@@ -1,0 +1,40 @@
+package settings
+
+import (
+	"context"
+	"io/fs"
+
+	"__FH_MODULE__/internal/modules"
+	"github.com/oarkflow/fh"
+)
+
+// ServiceName is the key for modules.Service[*Settings].
+const ServiceName = "settings"
+
+type module struct{}
+
+// Module returns the settings module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string        { return ServiceName }
+func (module) Migrations() fs.FS   { return nil }
+
+func (module) Register(_ context.Context, d *modules.Deps) error {
+	s, err := Load("")
+	if err != nil {
+		return err
+	}
+	d.Provide(ServiceName, &s)
+	// What the sign-in screen needs before anyone is authenticated.
+	d.App.Get("/auth/config", func(c fh.Ctx) error {
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{
+			"multiTenant":  s.MultiTenant(),
+			"defaultTenant": s.Tenancy.Default,
+			"registration": s.Registration.Enabled,
+			"identifier":   s.Auth.Identifier,
+			"mfa":          s.Auth.MFA.TOTP,
+		})
+	}).Name("auth-config").Tag("authentication")
+	return nil
+}

@@ -1,0 +1,229 @@
+// Package modules is the extension point for opt-in features.
+//
+// A module is a self-contained package under internal/modules/<name> that was
+// added with `fh-init -with <name>`. It contributes SQL migrations and
+// registers routes and services; the base application never imports a module
+// directly. internal/modules/enabled lists the modules in dependency order and
+// is regenerated whenever the set of enabled modules changes.
+package modules
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io/fs"
+	"sort"
+	"strings"
+	"time"
+
+	appconfig "__FH_MODULE__/internal/config"
+	appdb "__FH_MODULE__/internal/database"
+	appauth "__FH_MODULE__/internal/auth"
+	appsecurity "__FH_MODULE__/internal/security"
+	"github.com/oarkflow/authz"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/fh/mw/session"
+	"github.com/oarkflow/squealx"
+)
+
+// Module is implemented by every opt-in feature.
+type Module interface {
+	// Name is the stable identifier used for migrations and Service lookups.
+	Name() string
+	// Migrations returns the module's SQL files (*.sql, applied in filename
+	// order, each statement terminated by ";" + newline) or nil.
+	Migrations() fs.FS
+	// Register wires routes and publishes services via d.Provide. Modules are
+	// registered after everything they depend on.
+	Register(ctx context.Context, d *Deps) error
+}
+
+// Deps is what the host application hands to each module.
+type Deps struct {
+	App      *fh.App
+	API      *fh.Group // authenticated /api group (session + route policy)
+	Config   appconfig.Config
+	Store    *appdb.Store
+	DB       *squealx.DB
+	Engine   *authz.Engine
+	Guard    *appsecurity.Guard
+	Sessions *session.SessionManager
+	// SameOrigin reports whether a state-changing request to a public /auth
+	// route came from this application's own origin.
+	SameOrigin func(c fh.Ctx) bool
+	// Authorize decides whether the caller holds a permission such as
+	// "accounts:write". The rbac module replaces the default, which allows the
+	// "admin" role only.
+	Authorize func(c fh.Ctx, permission string) bool
+
+	services    map[string]any
+	permissions []string
+}
+
+// DeclarePermissions lists the "resource:action" permissions a module enforces.
+// GET /api/permissions reports which of them the caller holds, so the UI can
+// show only what the signed-in person may use.
+func (d *Deps) DeclarePermissions(perms ...string) { d.permissions = append(d.permissions, perms...) }
+
+// Require is middleware that allows the request only when the caller holds
+// permission.
+func (d *Deps) Require(permission string) fh.HandlerFunc {
+	return func(c fh.Ctx) error {
+		if _, ok := appauth.Principal(c); !ok {
+			return fh.NewHTTPError(fh.StatusUnauthorized, "LOGIN_REQUIRED", "login required")
+		}
+		if !d.Can(c, permission) {
+			return fh.NewHTTPError(fh.StatusForbidden, "FORBIDDEN", "access denied")
+		}
+		return c.Next()
+	}
+}
+
+// Can reports whether the signed-in caller holds permission.
+func (d *Deps) Can(c fh.Ctx, permission string) bool {
+	if d.Authorize != nil {
+		return d.Authorize(c, permission)
+	}
+	p, ok := appauth.Principal(c)
+	if !ok {
+		return false
+	}
+	for _, r := range p.Roles {
+		if r == "admin" {
+			return true
+		}
+	}
+	return false
+}
+
+// NewID returns a random 128-bit hex identifier.
+func NewID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// Provide publishes a service for later modules.
+func (d *Deps) Provide(name string, service any) {
+	if d.services == nil {
+		d.services = map[string]any{}
+	}
+	d.services[name] = service
+}
+
+// Lookup returns a published service by name, if any; use it for optional
+// integrations between modules that do not require one another.
+func (d *Deps) Lookup(name string) (any, bool) {
+	v, ok := d.services[name]
+	return v, ok
+}
+
+// Service returns a service published by an earlier module.
+func Service[T any](d *Deps, name string) (T, error) {
+	v, ok := d.services[name].(T)
+	if !ok {
+		var zero T
+		return zero, fmt.Errorf("modules: service %q is not available (is the module enabled?)", name)
+	}
+	return v, nil
+}
+
+// RequireRole allows the request only for principals holding one of roles.
+func RequireRole(roles ...string) fh.HandlerFunc {
+	return func(c fh.Ctx) error {
+		p, ok := appauth.Principal(c)
+		if !ok {
+			return fh.NewHTTPError(fh.StatusUnauthorized, "LOGIN_REQUIRED", "login required")
+		}
+		for _, have := range p.Roles {
+			for _, want := range roles {
+				if have == want {
+					return c.Next()
+				}
+			}
+		}
+		return fh.NewHTTPError(fh.StatusForbidden, "FORBIDDEN", "access denied")
+	}
+}
+
+// Setup migrates and registers every module in order.
+func Setup(ctx context.Context, d *Deps, mods []Module) error {
+	for _, m := range mods {
+		if err := migrate(ctx, d.DB, m); err != nil {
+			return fmt.Errorf("module %s: migrate: %w", m.Name(), err)
+		}
+	}
+	for _, m := range mods {
+		if err := m.Register(ctx, d); err != nil {
+			return fmt.Errorf("module %s: register: %w", m.Name(), err)
+		}
+	}
+	d.API.Get("/permissions", func(c fh.Ctx) error {
+		held := []string{}
+		for _, p := range d.permissions {
+			if d.Can(c, p) {
+				held = append(held, p)
+			}
+		}
+		sort.Strings(held)
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"permissions": held})
+	}).Name("permissions").Tag("api")
+	return nil
+}
+
+func migrate(ctx context.Context, db *squealx.DB, m Module) error {
+	files := m.Migrations()
+	if files == nil {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS module_migrations (module TEXT NOT NULL, version TEXT NOT NULL, applied_at TEXT NOT NULL, PRIMARY KEY (module, version))`); err != nil {
+		return err
+	}
+	var names []string
+	err := fs.WalkDir(files, ".", func(p string, e fs.DirEntry, err error) error {
+		if err == nil && !e.IsDir() && strings.HasSuffix(p, ".sql") {
+			names = append(names, p)
+		}
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		var n int
+		if err := db.GetContext(ctx, &n, `SELECT COUNT(*) FROM module_migrations WHERE module = ? AND version = ?`, m.Name(), name); err != nil {
+			return err
+		}
+		if n > 0 {
+			continue
+		}
+		raw, err := fs.ReadFile(files, name)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTxx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		for _, stmt := range strings.Split(string(raw), ";\n") {
+			if strings.TrimSpace(stmt) == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("%s: %w\n%s", name, err, stmt)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO module_migrations (module, version, applied_at) VALUES (?,?,?)`, m.Name(), name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}

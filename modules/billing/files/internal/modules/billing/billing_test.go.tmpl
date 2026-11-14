@@ -1,0 +1,134 @@
+package billing
+
+import (
+	"__FH_MODULE__/internal/modules"
+	"bytes"
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"__FH_MODULE__/internal/modules/audit"
+	"github.com/oarkflow/squealx/drivers/sqlite"
+
+)
+
+func newSvc(t *testing.T) *Service {
+	t.Helper()
+	db, err := sqlite.Open("file:"+t.TempDir()+"/b.db?_pragma=busy_timeout(5000)", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ApplyMigration(t, db, "mod/sql/0001_billing.sql")
+	return New(Deps{DB: db, Audit: audit.New(db), Now: time.Now})
+}
+
+var npr10 = Price{MeterID: "sc_1", Currency: "NPR", Minor: 1000}
+
+func TestChargeNeedsFundsAndNeverOverdraws(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	if _, err := s.Charge(ctx, "m1", npr10, "v1"); !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("no account: %v", err)
+	}
+	if err := s.OpenAccount(ctx, "admin", "m1", "NPR", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Charge(ctx, "m1", npr10, "v1"); !errors.Is(err, ErrInsufficient) {
+		t.Fatalf("empty prepaid: %v", err)
+	}
+	if _, err := s.TopUp(ctx, "admin", "m1", "NPR", 2500, "pay-1"); err != nil {
+		t.Fatal(err)
+	}
+	for i, ref := range []string{"v1", "v2"} {
+		e, err := s.Charge(ctx, "m1", npr10, ref)
+		if err != nil || e.BalanceAfter != int64(1500-i*1000) {
+			t.Fatalf("charge %s: %+v %v", ref, e, err)
+		}
+	}
+	if _, err := s.Charge(ctx, "m1", npr10, "v3"); !errors.Is(err, ErrInsufficient) {
+		t.Fatalf("500 left must not pay 1000: %v", err)
+	}
+	a, _ := s.Accounts(ctx, "m1")
+	if a[0].Balance != 500 {
+		t.Fatalf("balance = %d", a[0].Balance)
+	}
+}
+
+func TestChargeAndTopUpAreIdempotent(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	_ = s.OpenAccount(ctx, "admin", "m1", "NPR", 0)
+	for i := 0; i < 3; i++ {
+		if _, err := s.TopUp(ctx, "admin", "m1", "NPR", 5000, "pay-1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Charge(ctx, "m1", npr10, "v1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a, _ := s.Accounts(ctx, "m1"); a[0].Balance != 4000 {
+		t.Fatalf("balance = %d, want 4000 (one top-up, one charge)", a[0].Balance)
+	}
+}
+
+func TestRefundAndCreditLimit(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	_ = s.OpenAccount(ctx, "admin", "m1", "NPR", 1500) // postpaid up to NPR 15
+	if _, err := s.Charge(ctx, "m1", npr10, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Charge(ctx, "m1", npr10, "b"); !errors.Is(err, ErrInsufficient) {
+		t.Fatalf("limit exceeded: %v", err)
+	}
+	if err := s.Refund(ctx, "m1", npr10, "a"); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Refund(ctx, "m1", npr10, "a") // a second refund is a no-op
+	if a, _ := s.Accounts(ctx, "m1"); a[0].Balance != 0 {
+		t.Fatalf("balance after refund = %d", a[0].Balance)
+	}
+}
+
+func TestConcurrentChargesNeverOverspend(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	_ = s.OpenAccount(ctx, "admin", "m1", "NPR", 0)
+	_, _ = s.TopUp(ctx, "admin", "m1", "NPR", 5000, "p")
+	var wg sync.WaitGroup
+	var ok int
+	var mu sync.Mutex
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := s.Charge(ctx, "m1", npr10, modules.NewID()); err == nil {
+				mu.Lock()
+				ok++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if a, _ := s.Accounts(ctx, "m1"); ok != 5 || a[0].Balance != 0 {
+		t.Fatalf("succeeded=%d balance=%d, want 5 and 0", ok, a[0].Balance)
+	}
+}
+
+func TestZeroPriceIsFreeAndMoneyFormats(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	if e, err := s.Charge(ctx, "m1", Price{Currency: "NPR"}, "x"); err != nil || e.ID != "" {
+		t.Fatalf("free: %+v %v", e, err)
+	}
+	if got := Money("NPR", 1000); got != "NPR 10.00" {
+		t.Fatalf("money = %q", got)
+	}
+}
+
+func TestCSVNeutralisesFormulas(t *testing.T) {
+	var b bytes.Buffer
+	_ = WriteCSV(&b, []Entry{{CreatedAt: "t", Kind: "scan", Currency: "NPR", AmountMinor: -1000, BalanceAfter: 4000, Ref: "=cmd|' /C calc'!A0"}})
+	if !strings.Contains(b.String(), "'=cmd") || !strings.Contains(b.String(), "-10.00") {
+		t.Fatalf("csv = %q", b.String())
+	}
+}

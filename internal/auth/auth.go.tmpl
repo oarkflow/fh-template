@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"sync/atomic"
 
 	"github.com/oarkflow/authz"
 	"github.com/oarkflow/fh"
@@ -22,22 +23,71 @@ type RoleStore interface {
 	EnsureUser(ctx context.Context, id, name, role string) (appdb.User, error)
 }
 
+// Identity is a successfully authenticated account.
+type Identity struct {
+	ID     string
+	Name   string
+	Tenant string
+	Roles  []string
+}
+
+// Verifier authenticates a login attempt against an identity source. A module
+// (accounts) installs one with SetVerifier; without one the single development
+// credential from the environment is used.
+type Verifier interface {
+	Verify(c fh.Ctx, in LoginInput) (Identity, error)
+}
+
+var verifier atomic.Pointer[Verifier]
+
+// SetVerifier replaces the login backend. Safe to call while serving.
+func SetVerifier(v Verifier) { verifier.Store(&v) }
+
+// LoginInput is the decoded body of POST /auth/login.
+type LoginInput struct {
+	Username string
+	Password string
+	OTP      string // optional second factor
+	Tenant   string // optional; multi-tenant deployments
+}
+
 // Login authenticates the credential and loads the caller's RBAC role from
 // the database (defaultRole seeds it on first login) rather than hardcoding
 // it, so promoting a user to admin/editor/viewer is a data change, not a
-// redeploy.
-func Login(c fh.Ctx, manager *session.SessionManager, store RoleStore, username, password, expectedUser, expectedPassword, defaultRole string) error {
-	if !secretEqual(username, expectedUser) || !secretEqual(password, expectedPassword) {
+// redeploy. When a Verifier is installed it decides instead.
+func Login(c fh.Ctx, manager *session.SessionManager, store RoleStore, in LoginInput, expectedUser, expectedPassword, defaultRole string) error {
+	if v := verifier.Load(); v != nil {
+		id, err := (*v).Verify(c, in)
+		if err != nil {
+			return err
+		}
+		return establish(c, manager, id)
+	}
+	if !secretEqual(in.Username, expectedUser) || !secretEqual(in.Password, expectedPassword) {
 		return fh.NewHTTPError(fh.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid credentials")
 	}
-	user, err := store.EnsureUser(c.Context(), username, username, defaultRole)
+	user, err := store.EnsureUser(c.Context(), in.Username, in.Username, defaultRole)
 	if err != nil {
 		return fh.NewHTTPError(fh.StatusServiceUnavailable, "ROLE_LOOKUP_FAILED", "could not resolve account role")
 	}
+	return establish(c, manager, Identity{ID: in.Username, Name: in.Username, Roles: []string{user.Role}})
+}
+
+func establish(c fh.Ctx, manager *session.SessionManager, id Identity) error {
 	web := session.Get(c)
-	web.Set(userKey, username)
-	web.Set("roles", []string{user.Role})
+	web.Set(userKey, id.ID)
+	web.Set("roles", id.Roles)
+	web.Set("tenant", id.Tenant)
+	web.Set("name", id.Name)
 	return manager.Regenerate(c, web)
+}
+
+// Details returns the display name and tenant of the signed-in account.
+func Details(c fh.Ctx) (name, tenant string) {
+	web := session.Get(c)
+	name, _ = web.Get("name").(string)
+	tenant, _ = web.Get("tenant").(string)
+	return
 }
 
 func Principal(c fh.Ctx) (fh.Principal, bool) {
@@ -50,7 +100,8 @@ func Principal(c fh.Ctx) (fh.Principal, bool) {
 	if len(roles) == 0 {
 		roles = []string{"viewer"}
 	}
-	p := fh.Principal{ID: user, Subject: user, Type: "user", Roles: roles, AuthMethod: "session"}
+	tenant, _ := web.Get("tenant").(string)
+	p := fh.Principal{ID: user, Subject: user, Type: "user", TenantID: tenant, Roles: roles, AuthMethod: "session"}
 	fh.SetPrincipal(c, p)
 	return p, true
 }
@@ -89,15 +140,17 @@ func AuthorizeOwned(c fh.Ctx, engine *authz.Engine, principal fh.Principal, acti
 	return nil
 }
 
-func DecodeLogin(c fh.Ctx) (string, string, error) {
+func DecodeLogin(c fh.Ctx) (LoginInput, error) {
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		OTP      string `json:"otp"`
+		Tenant   string `json:"tenant"`
 	}
 	if err := json.Unmarshal(c.BodyCopy(), &input); err != nil || input.Username == "" || input.Password == "" {
-		return "", "", fh.NewHTTPError(fh.StatusBadRequest, "INVALID_LOGIN", "username and password are required")
+		return LoginInput{}, fh.NewHTTPError(fh.StatusBadRequest, "INVALID_LOGIN", "username and password are required")
 	}
-	return input.Username, input.Password, nil
+	return LoginInput{Username: input.Username, Password: input.Password, OTP: input.OTP, Tenant: input.Tenant}, nil
 }
 
 // rolesFromSession normalizes the "roles" session value. A freshly set

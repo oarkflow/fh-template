@@ -1,0 +1,137 @@
+package workflow
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io/fs"
+	"log"
+	"os"
+	"time"
+
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/settings"
+	"__FH_MODULE__/internal/modules/vault"
+	"github.com/oarkflow/ref/pipeline"
+)
+
+//go:embed sql/*.sql
+var migrations embed.FS
+
+// ServiceName is the key for modules.Service[*Service].
+const ServiceName = "workflow"
+
+type module struct{}
+
+// Module returns the workflow module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string { return ServiceName }
+
+func (module) Migrations() fs.FS {
+	sub, _ := fs.Sub(migrations, "sql")
+	return sub
+}
+
+// messenger is what delivery optionally uses from the accounts module.
+type messenger interface {
+	ContactOf(ctx context.Context, id, channel string) (string, bool)
+	Send(ctx context.Context, channel, to, kind, message string) error
+}
+
+func (module) Register(ctx context.Context, d *modules.Deps) error {
+	cfg, err := modules.Service[*settings.Settings](d, settings.ServiceName)
+	if err != nil {
+		return err
+	}
+	v, err := modules.Service[*vault.Vault](d, vault.ServiceName)
+	if err != nil {
+		return err
+	}
+	al, err := modules.Service[*audit.Log](d, audit.ServiceName)
+	if err != nil {
+		return err
+	}
+	dir := os.Getenv("APP_WORKFLOW_DIR")
+	if dir == "" {
+		dir = "config/workflows"
+	}
+	set, err := Load(dir)
+	if err != nil {
+		return err
+	}
+	// Definitions and signatures are keyed from the vault's index key, so they
+	// are stable across restarts and unreadable without it.
+	key := []byte(v.BlindIndex("workflow", "definition-signing-key"))
+	svc := New(Deps{DB: d.DB, Vault: v, Audit: al}, set, key)
+	svc.Hooks = map[string]Hook{
+		// Puts a workflow event in the audit trail (deadlines, escalations, holds).
+		"audit.event": func(ctx context.Context, c *pipeline.Case, ev pipeline.Event) error {
+			actor := ev.Actor
+			if actor == "" {
+				actor = "system"
+			}
+			return al.Append(ctx, actor, "workflow."+ev.Name, c.ID, map[string]any{"stage": ev.Stage, "pipeline": c.Pipeline})
+		},
+	}
+	svc.LoadPublished(ctx) // versions published at runtime replace the files on disk
+	d.Provide(ServiceName, svc)
+	d.DeclarePermissions(Permissions...)
+
+	deliver := func(ctx context.Context, b pipeline.NotificationBatch) error {
+		body := b.Subject()
+		if txt := b.Body(); txt != "" && txt != body {
+			body += "\n" + txt
+		}
+		kind := "workflow"
+		if len(b.Items) == 1 {
+			kind = b.Items[0].Event
+		}
+		switch b.Channel {
+		case "inbox":
+			_, err := d.DB.ExecContext(ctx, `INSERT INTO notifications (id, account_id, kind, body, created_at) VALUES (?,?,?,?,?)`, modules.NewID(), b.User, kind, body, svc.Stamp())
+			return err
+		case "email", "sms":
+			raw, _ := d.Lookup("accounts")
+			m, ok := raw.(messenger)
+			if !ok {
+				return nil // no account directory: nothing to deliver to
+			}
+			to, ok := m.ContactOf(ctx, b.User, b.Channel)
+			if !ok {
+				return nil // nothing to send to: not a failure worth retrying
+			}
+			return m.Send(ctx, b.Channel, to, "workflow", body)
+		}
+		return fmt.Errorf("unknown channel %q", b.Channel)
+	}
+	startWorkers(svc, deliver)
+	register(d, cfg, svc)
+	return nil
+}
+
+// startWorkers runs the periodic jobs for the life of the process.
+func startWorkers(svc *Service, deliver func(context.Context, pipeline.NotificationBatch) error) {
+	every := func(d time.Duration, name string, fn func(context.Context) error) {
+		go func() {
+			t := time.NewTicker(d)
+			defer t.Stop()
+			for range t.C {
+				if err := fn(context.Background()); err != nil {
+					log.Printf("workflow worker %s: %v", name, err)
+				}
+			}
+		}()
+	}
+	// Planned notifications are delivered with retry; a delivery that keeps
+	// failing is dead-lettered after five attempts.
+	every(15*time.Second, "notifications", func(ctx context.Context) error {
+		_, err := svc.FlushNotifications(ctx, deliver)
+		return err
+	})
+	every(10*time.Minute, "sla", func(ctx context.Context) error { _, err := svc.SweepAll(ctx, SweepOpen); return err })
+	every(24*time.Hour, "retention", func(ctx context.Context) error { _, err := svc.SweepAll(ctx, SweepFinished); return err })
+	// Cases held because their checks could not run yet are retried.
+	every(time.Hour, "recheck", func(ctx context.Context) error { _, err := svc.RerunChecks(ctx); return err })
+}

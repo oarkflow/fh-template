@@ -1,0 +1,126 @@
+package mod
+
+import (
+	"context"
+	"embed"
+	"io/fs"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+
+	appauth "__FH_MODULE__/internal/auth"
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/billing"
+	"__FH_MODULE__/internal/modules/billing/payments"
+	"__FH_MODULE__/internal/modules/settings"
+	"github.com/oarkflow/fh"
+)
+
+//go:embed sql/*.sql
+var migrations embed.FS
+
+// Service names for modules.Service.
+const (
+	ServiceName  = "billing"  // *Service: ledger, accounts, invoices
+	PricingName  = "pricing"  // *Pricing: rate cards, tiers, meters, PriceFor
+	PaymentsName = "payments" // *payments.Service
+)
+
+type module struct{}
+
+// Module returns the billing module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string { return ServiceName }
+
+func (module) Migrations() fs.FS {
+	sub, _ := fs.Sub(migrations, "sql")
+	return sub
+}
+
+func envInt(name string, def int64) int64 {
+	if n, err := strconv.ParseInt(os.Getenv(name), 10, 64); err == nil {
+		return n
+	}
+	return def
+}
+
+func (module) Register(_ context.Context, d *modules.Deps) error {
+	cfg, err := modules.Service[*settings.Settings](d, settings.ServiceName)
+	if err != nil {
+		return err
+	}
+	al, err := modules.Service[*audit.Log](d, audit.ServiceName)
+	if err != nil {
+		return err
+	}
+	deps := billing.Deps{DB: d.DB, Audit: al}
+	svc := billing.New(deps)
+	for _, c := range strings.Split(os.Getenv("APP_BILLING_CURRENCIES"), ",") {
+		if c = strings.TrimSpace(strings.ToUpper(c)); c != "" {
+			svc.Currencies = append(svc.Currencies, c)
+		}
+	}
+	svc.TaxBps = int(envInt("APP_BILLING_TAX_BPS", 0))
+	svc.SellerName, svc.SellerTaxID = os.Getenv("APP_BILLING_SELLER_NAME"), os.Getenv("APP_BILLING_SELLER_TAX_ID")
+	svc.OnLowBalance = func(ctx context.Context, customerID, currency string, balance, level int64) {
+		// The customer id is an account or a tenant; notify the account when it is one.
+		_, _ = d.DB.ExecContext(ctx, `INSERT INTO notifications (id, account_id, kind, body, created_at) VALUES (?,?,?,?,?)`, modules.NewID(), customerID, "billing.low_balance",
+			"Your "+currency+" balance is "+billing.Money(currency, balance)+", under your warning level of "+billing.Money(currency, level)+". Top up to keep going.", deps.Stamp())
+	}
+	pricing := billing.NewPricing(deps, svc)
+
+	payCfg := payments.Config{
+		Provider: os.Getenv("APP_PAY_PROVIDER"), LinkURL: os.Getenv("APP_PAY_LINK_URL"), ReturnURL: os.Getenv("APP_PAY_RETURN_URL"),
+		ReturnSecret: os.Getenv("APP_PAY_RETURN_SECRET"), App: os.Getenv("APP_PAY_APP"), Currency: os.Getenv("APP_PAY_CURRENCY"),
+		UnitMinor: envInt("APP_PAY_UNIT_MINOR", 0), MinUnits: envInt("APP_PAY_MIN_UNITS", 1), MaxUnits: envInt("APP_PAY_MAX_UNITS", 1000),
+	}
+	if err := payCfg.Validate(d.Config.Production); err != nil {
+		return err
+	}
+	gw, err := payments.NewGateway(payCfg)
+	if err != nil {
+		return err
+	}
+	pay := payments.New(deps, payCfg, gw, svc)
+	d.Provide(ServiceName, svc)
+	d.Provide(PricingName, pricing)
+	d.Provide(PaymentsName, pay)
+	d.DeclarePermissions(Permissions...)
+
+	register(d, cfg, svc, pricing, pay)
+	return nil
+}
+
+// customerOf is the party that is billed for the caller: the tenant in a
+// multi-tenant deployment (an organisation), otherwise the account itself.
+func customerOf(cfg *settings.Settings, c fh.Ctx) string {
+	p, _ := appauth.Principal(c)
+	if cfg.MultiTenant() && p.TenantID != "" {
+		return p.TenantID
+	}
+	return p.ID
+}
+
+func registerPayReturn(d *modules.Deps, pay *payments.Service) {
+	// The page the payment gateway sends the browser back to. Nothing is trusted
+	// from the redirect except what the gateway signed (verified in Complete); a
+	// session is not needed and the credit is idempotent, so a refresh or a replay
+	// adds nothing.
+	d.App.Get("/pay/return", func(c fh.Ctx) error {
+		c.Set("Cache-Control", "no-store")
+		raw := c.OriginalURL()
+		if i := strings.Index(raw, "?"); i >= 0 {
+			raw = raw[i:]
+		} else {
+			raw = ""
+		}
+		res, err := pay.Complete(c.Context(), raw)
+		if err != nil {
+			return c.Redirect("/?pay=invalid", fh.StatusSeeOther)
+		}
+		return c.Redirect("/?pay="+url.QueryEscape(res.Status)+"&order="+url.QueryEscape(res.OrderID), fh.StatusSeeOther)
+	}).Name("pay-return").Tag("billing")
+}

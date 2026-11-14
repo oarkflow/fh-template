@@ -1,0 +1,782 @@
+// Package rbac is the access-control datasource and manager. Roles live in SQL
+// and are enforced by the authz engine; this package rebuilds that engine
+// when they change, so an edit takes effect on every instance within seconds.
+package rbac
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/oarkflow/authz"
+	"github.com/oarkflow/authz/pkg/logger"
+	"github.com/oarkflow/authz/pkg/stores"
+
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/settings"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/squealx"
+)
+
+var (
+	idRe       = regexp.MustCompile(`^[a-z][a-z0-9_]{1,31}$`)
+	actionRe   = regexp.MustCompile(`^([a-z][a-z_]{0,31}|\*)$`)
+	resourceRe = regexp.MustCompile(`^([a-z][a-z_]{0,31}|\*)$`)
+)
+
+// tenantSnap is one tenant's roles and grants.
+type tenantSnap struct {
+	roles   map[string]Role
+	members map[string][]string
+}
+
+// snapshot is everything a decision needs, replaced atomically on change.
+type snapshot struct {
+	eng     *authz.Engine
+	tenants map[string]*tenantSnap
+	rev     int64
+}
+
+// Service decides and manages access, separately for each tenant.
+type Service struct {
+	DB    *squealx.DB
+	Audit *audit.Log
+	Now   func() time.Time
+	// defaults are the roles installed for a tenant the first time it is seen
+	// (from role blocks in config/app.bcl); after that the database is authoritative.
+	defaults []Role
+	declared []Permission
+	snap     atomic.Pointer[snapshot]
+	polled   atomic.Int64 // unix nanos of the last revision check
+	every    time.Duration
+	reloadMu sync.Mutex
+	seedMu   sync.Mutex
+	// AccountTenant, when set, says which tenant an account belongs to, so a role
+	// can be granted only to an account of the grantor's own tenant.
+	AccountTenant func(ctx context.Context, accountID string) (string, bool)
+}
+
+// New loads the roles of every tenant that has them. A tenant's built-in roles
+// are installed the first time that tenant is seen.
+func New(ctx context.Context, db *squealx.DB, al *audit.Log, defaults []Role) (*Service, error) {
+	s := &Service{DB: db, Audit: al, defaults: defaults, every: 2 * time.Second}
+	if err := s.reload(ctx); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// FromSettings converts the BCL role blocks into rbac roles. Permissions are
+// "resource:action", or "*" for everything.
+func FromSettings(roles []settings.Role) []Role {
+	out := make([]Role, 0, len(roles))
+	for _, r := range roles {
+		role := Role{ID: r.ID, Name: r.Title, System: true, Inherits: r.Inherits}
+		if role.Name == "" {
+			role.Name = r.ID
+		}
+		for _, p := range r.Permissions {
+			if p == "*" {
+				role.Permissions = append(role.Permissions, Permission{Action: "*", Resource: "*"})
+				continue
+			}
+			resource, action, _ := strings.Cut(p, ":")
+			role.Permissions = append(role.Permissions, Permission{Action: action, Resource: resource})
+		}
+		out = append(out, role)
+	}
+	return out
+}
+
+// Declare adds permissions to the catalog shown in the admin UI, so modules can
+// advertise what they enforce even before any role holds it.
+func (s *Service) Declare(perms ...Permission) { s.declared = append(s.declared, perms...) }
+
+func (s *Service) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
+}
+func (s *Service) stamp() string { return s.now().UTC().Format(time.RFC3339) }
+
+// Err builds an HTTP error carrying a stable code.
+func Err(status int, code, format string, args ...any) error {
+	return fh.NewHTTPError(status, code, fmt.Sprintf(format, args...))
+}
+
+// seedTenant installs the built-in roles for a tenant that has none yet.
+func (s *Service) seedTenant(ctx context.Context, tenant string) error {
+	s.seedMu.Lock()
+	defer s.seedMu.Unlock()
+	if sn := s.snap.Load(); sn != nil {
+		if _, ok := sn.tenants[tenant]; ok {
+			return nil
+		}
+	}
+	for _, r := range s.defaults {
+		if err := s.insertRole(ctx, tenant, r, "system", false); err != nil {
+			return err
+		}
+	}
+	if err := s.bump(ctx, tenant, "system", "built-in roles"); err != nil {
+		return err
+	}
+	return s.reload(ctx)
+}
+
+// view returns a tenant's snapshot, installing its built-in roles on first use.
+// An empty tenant has no access at all.
+func (s *Service) view(ctx context.Context, tenant string) *tenantSnap {
+	s.sync(ctx)
+	if tenant == "" {
+		return &tenantSnap{roles: map[string]Role{}, members: map[string][]string{}}
+	}
+	if t, ok := s.snap.Load().tenants[tenant]; ok {
+		return t
+	}
+	if err := s.seedTenant(ctx, tenant); err != nil {
+		return &tenantSnap{roles: map[string]Role{}, members: map[string][]string{}}
+	}
+	if t, ok := s.snap.Load().tenants[tenant]; ok {
+		return t
+	}
+	return &tenantSnap{roles: map[string]Role{}, members: map[string][]string{}}
+}
+
+// insertRole writes a role. With overwrite it replaces an existing one;
+// without, an existing role is left as it is (installing built-ins never undoes
+// an administrator's edit).
+func (s *Service) insertRole(ctx context.Context, tenant string, r Role, by string, overwrite bool) error {
+	perms, _ := json.Marshal(r.Permissions)
+	inh, _ := json.Marshal(nonNil(r.Inherits))
+	sys := 0
+	if r.System {
+		sys = 1
+	}
+	conflict := `ON CONFLICT(tenant_id, id) DO NOTHING`
+	if overwrite {
+		conflict = `ON CONFLICT(tenant_id, id) DO UPDATE SET name=excluded.name, permissions=excluded.permissions, inherits=excluded.inherits, updated_at=excluded.updated_at, updated_by=excluded.updated_by`
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO rbac_roles (`+roleCols+`) VALUES (?,?,?,?,?,?,?,?) `+conflict,
+		tenant, r.ID, r.Name, string(perms), string(inh), sys, s.stamp(), by)
+	return err
+}
+
+func nonNil(x []string) []string {
+	if x == nil {
+		return []string{}
+	}
+	return x
+}
+
+// Close stops the engine's background audit worker after it has written every
+// queued denial, so the database can be closed straight afterwards. Decisions
+// made after Close are still answered but no longer logged.
+func (s *Service) Close() error {
+	if sn := s.snap.Load(); sn != nil {
+		return sn.eng.Close()
+	}
+	return nil
+}
+
+// ---- reload and revision polling ---------------------------------------------
+
+func (s *Service) currentRev(ctx context.Context) (int64, error) {
+	var v int64
+	err := s.DB.GetContext(ctx, &v, `SELECT v FROM rbac_meta WHERE k='rev'`)
+	return v, err
+}
+
+func (s *Service) reload(ctx context.Context) error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	rev, err := s.currentRev(ctx)
+	if err != nil {
+		return err
+	}
+	var rows []roleRow
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT `+roleCols+` FROM rbac_roles`); err != nil {
+		return err
+	}
+	tenants := map[string]*tenantSnap{}
+	get := func(t string) *tenantSnap {
+		if tenants[t] == nil {
+			tenants[t] = &tenantSnap{roles: map[string]Role{}, members: map[string][]string{}}
+		}
+		return tenants[t]
+	}
+	for _, row := range rows {
+		r, err := row.role()
+		if err != nil {
+			return err
+		}
+		get(row.TenantID).roles[r.ID] = r
+	}
+	var mem []struct {
+		Tenant  string `db:"tenant_id"`
+		Account string `db:"account_id"`
+		Role    string `db:"role_id"`
+	}
+	if err := s.DB.SelectContext(ctx, &mem, `SELECT tenant_id, account_id, role_id FROM rbac_members`); err != nil {
+		return err
+	}
+	for _, m := range mem {
+		t := get(m.Tenant)
+		t.members[m.Account] = append(t.members[m.Account], m.Role)
+	}
+	// One engine for the life of the process (it runs an audit worker that cannot
+	// be stopped). On change its role and decision caches are evicted instead.
+	var eng *authz.Engine
+	if old := s.snap.Load(); old != nil {
+		eng = old.eng
+		for tn, ot := range old.tenants {
+			for id := range ot.roles {
+				if nt, ok := tenants[tn]; !ok || nt.roles[id].ID == "" {
+					_ = eng.DeleteRole(ctx, engineID(tn, id))
+				}
+			}
+		}
+	} else {
+		eng = authz.NewEngine(stores.NewMemoryPolicyStore(), sqlRoles{s.DB}, stores.NewMemoryACLStore(), sqlAudit{s.DB},
+			authz.WithLogger(logger.NewNullLogger()))
+	}
+	for tn, t := range tenants {
+		for _, r := range t.roles {
+			_ = eng.UpdateRole(ctx, toEngine(tn, r))
+		}
+	}
+	eng.InvalidateDecisionCache()
+	s.snap.Store(&snapshot{eng: eng, tenants: tenants, rev: rev})
+	s.polled.Store(time.Now().UnixNano())
+	return nil
+}
+
+// sync reloads when another instance (or this one) changed the roles. It is
+// called on every decision but only touches the database every `every`.
+func (s *Service) sync(ctx context.Context) {
+	last := s.polled.Load()
+	if time.Since(time.Unix(0, last)) < s.every {
+		return
+	}
+	if !s.polled.CompareAndSwap(last, time.Now().UnixNano()) {
+		return
+	}
+	rev, err := s.currentRev(ctx)
+	if err != nil {
+		return
+	}
+	if cur := s.snap.Load(); cur == nil || cur.rev != rev {
+		_ = s.reload(ctx)
+	}
+}
+
+// bump records a new revision of one tenant's roles and grants (for history
+// and rollback). The revision counter is shared, so every instance notices.
+func (s *Service) bump(ctx context.Context, tenant, author, note string) error {
+	var rows []roleRow
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT `+roleCols+` FROM rbac_roles WHERE tenant_id=? ORDER BY id`, tenant); err != nil {
+		return err
+	}
+	var mem []Member
+	if err := s.DB.SelectContext(ctx, &mem, `SELECT account_id, role_id, granted_by, granted_at FROM rbac_members WHERE tenant_id=? ORDER BY account_id, role_id`, tenant); err != nil {
+		return err
+	}
+	snap, _ := json.Marshal(struct {
+		Roles   []roleRow `json:"roles"`
+		Members []Member  `json:"members"`
+	}{rows, mem})
+	var rev int64
+	if err := s.DB.GetContext(ctx, &rev, `UPDATE rbac_meta SET v = v + 1 WHERE k='rev' RETURNING v`); err != nil {
+		return err
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO rbac_history (rev, snapshot, author, note, at, tenant_id) VALUES (?,?,?,?,?,?)`, rev, string(snap), author, note, s.stamp(), tenant)
+	return err
+}
+
+// Member is an extra role granted to an account.
+type Member struct {
+	AccountID string `db:"account_id" json:"accountId"`
+	RoleID    string `db:"role_id" json:"roleId"`
+	GrantedBy string `db:"granted_by" json:"grantedBy"`
+	GrantedAt string `db:"granted_at" json:"grantedAt"`
+}
+
+// ---- decisions ----------------------------------------------------------------
+
+// Effective returns the account's roles in its tenant: its base role plus any
+// granted roles, with everything they inherit, restricted to roles that exist.
+func (s *Service) Effective(ctx context.Context, tenant, accountID, base string) []string {
+	t := s.view(ctx, tenant)
+	seen := map[string]bool{}
+	var walk func(id string)
+	walk = func(id string) {
+		r, ok := t.roles[id]
+		if !ok || seen[id] {
+			return
+		}
+		seen[id] = true
+		for _, p := range r.Inherits {
+			walk(p)
+		}
+	}
+	walk(base)
+	for _, g := range t.members[accountID] {
+		walk(g)
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Check reports whether the account may perform action on a resource type, under
+// the roles of its own tenant. Unknown roles, actions and resources are denied.
+func (s *Service) Check(ctx context.Context, tenant, accountID, baseRole, action, resource string) bool {
+	if tenant == "" || !actionRe.MatchString(action) || !resourceRe.MatchString(resource) || resource == "*" || action == "*" && resource != "*" {
+		return false
+	}
+	roles := s.Effective(ctx, tenant, accountID, baseRole)
+	if len(roles) == 0 {
+		return false
+	}
+	sn := s.snap.Load()
+	ns := make([]string, len(roles))
+	for i, r := range roles {
+		ns[i] = engineID(tenant, r)
+	}
+	// The decision cache is keyed by subject, so the subject key carries the tenant
+	// and the roles: changing someone's roles can never reuse a decision made under
+	// the old ones, and one tenant's decision is never another's.
+	sub := &authz.Subject{ID: accountID + "|" + tenant + "|" + strings.Join(roles, ","), Type: "user", TenantID: tenant, Roles: ns}
+	res := &authz.Resource{ID: "any", Type: engineType(resource), TenantID: tenant}
+	d, err := sn.eng.Authorize(ctx, sub, authz.Action(action), res, &authz.Environment{Time: time.Now(), TenantID: tenant})
+	return err == nil && d != nil && d.Allowed
+}
+
+// ---- management ---------------------------------------------------------------
+
+// Actor is who is changing access, and in which tenant; they can only hand out
+// what they hold, and only inside their own tenant.
+type Actor struct{ ID, Role, Tenant string }
+
+func (s *Service) holds(ctx context.Context, a Actor, perms []Permission) error {
+	root := s.wildcard(ctx, a)
+	for _, p := range perms {
+		// The administrator is the root of trust and may grant any specific
+		// permission; a wildcard still has to be held, and delegates only ever
+		// hand out what they hold themselves.
+		if root && p.Action != "*" && p.Resource != "*" {
+			continue
+		}
+		if p.Action == "*" || p.Resource == "*" {
+			if !s.wildcard(ctx, a) {
+				return Err(403, "ESCALATION", "you cannot grant a wildcard permission you do not hold")
+			}
+			continue
+		}
+		if !s.Check(ctx, a.Tenant, a.ID, a.Role, p.Action, p.Resource) {
+			return Err(403, "ESCALATION", "you cannot grant %s:%s because you do not hold it", p.Action, p.Resource)
+		}
+	}
+	return nil
+}
+
+// wildcard reports whether the actor has a role with the wildcard permission.
+func (s *Service) wildcard(ctx context.Context, a Actor) bool {
+	t := s.view(ctx, a.Tenant)
+	for _, id := range s.Effective(ctx, a.Tenant, a.ID, a.Role) {
+		for _, p := range t.roles[id].Permissions {
+			if p.Action == "*" && p.Resource == "*" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Roles lists every role of a tenant.
+func (s *Service) Roles(ctx context.Context, tenant string) []Role {
+	t := s.view(ctx, tenant)
+	out := make([]Role, 0, len(t.roles))
+	for _, r := range t.roles {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func validate(r Role, all map[string]Role) error {
+	if !idRe.MatchString(r.ID) {
+		return Err(400, "INVALID_ROLE", "role id must be 2-32 characters: lower-case letters, digits and underscores, starting with a letter")
+	}
+	if n := len([]rune(strings.TrimSpace(r.Name))); n < 2 || n > 60 {
+		return Err(400, "INVALID_ROLE", "role name must be 2 to 60 characters")
+	}
+	if len(r.Permissions) > 100 {
+		return Err(400, "INVALID_ROLE", "a role holds at most 100 permissions")
+	}
+	for _, p := range r.Permissions {
+		if !actionRe.MatchString(p.Action) || !resourceRe.MatchString(p.Resource) {
+			return Err(400, "INVALID_PERMISSION", "%q:%q is not a valid permission (lower-case words, or *)", p.Action, p.Resource)
+		}
+		if (p.Action == "*") != (p.Resource == "*") {
+			return Err(400, "INVALID_PERMISSION", "a wildcard must be *:* ; partial wildcards are not allowed")
+		}
+	}
+	for _, in := range r.Inherits {
+		if _, ok := all[in]; !ok {
+			return Err(400, "INVALID_ROLE", "inherited role %q does not exist", in)
+		}
+		if in == r.ID {
+			return Err(400, "INVALID_ROLE", "a role cannot inherit itself")
+		}
+	}
+	// cycle check on the proposed graph
+	g := map[string][]string{}
+	for id, x := range all {
+		g[id] = x.Inherits
+	}
+	g[r.ID] = r.Inherits
+	var visit func(id string, path map[string]bool) bool
+	visit = func(id string, path map[string]bool) bool {
+		if path[id] {
+			return true
+		}
+		path[id] = true
+		for _, n := range g[id] {
+			if visit(n, path) {
+				return true
+			}
+		}
+		delete(path, id)
+		return false
+	}
+	if visit(r.ID, map[string]bool{}) {
+		return Err(400, "INVALID_ROLE", "role inheritance would form a cycle")
+	}
+	return nil
+}
+
+// SaveRole creates or updates a role of the actor's tenant. The actor must hold
+// every permission they put in it, and the built-in administrator can never lose
+// its wildcard.
+func (s *Service) SaveRole(ctx context.Context, actor Actor, r Role, note string) (Role, error) {
+	t := s.view(ctx, actor.Tenant)
+	cur, exists := t.roles[r.ID]
+	r.Name = strings.TrimSpace(r.Name)
+	r.System = exists && cur.System // clients cannot mint system roles or demote them
+	if err := validate(r, t.roles); err != nil {
+		return Role{}, err
+	}
+	if exists && cur.System && hasWildcard(cur.Permissions) && !hasWildcard(r.Permissions) && s.wildcardRoles(t) <= 1 {
+		return Role{}, Err(409, "LOCKOUT", "the last full-access role must keep its wildcard permission, or nobody could manage access")
+	}
+	if err := s.holds(ctx, actor, r.Permissions); err != nil {
+		return Role{}, err
+	}
+	// Taking permissions away from a role also needs standing: a delegate must
+	// not be able to strip a role they could not have granted.
+	if exists {
+		if err := s.holds(ctx, actor, cur.Permissions); err != nil {
+			return Role{}, Err(403, "ESCALATION", "you cannot change a role that holds permissions you do not hold")
+		}
+	}
+	if err := s.insertRole(ctx, actor.Tenant, r, actor.ID, true); err != nil {
+		return Role{}, err
+	}
+	_ = s.Audit.Append(ctx, actor.ID, "rbac.save_role", r.ID, map[string]any{"tenant": actor.Tenant, "permissions": len(r.Permissions), "inherits": r.Inherits})
+	if err := s.bump(ctx, actor.Tenant, actor.ID, orDefault(note, "save role "+r.ID)); err != nil {
+		return Role{}, err
+	}
+	if err := s.reload(ctx); err != nil {
+		return Role{}, err
+	}
+	return s.snap.Load().tenants[actor.Tenant].roles[r.ID], nil
+}
+
+func hasWildcard(perms []Permission) bool {
+	for _, p := range perms {
+		if p.Action == "*" && p.Resource == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// wildcardRoles counts a tenant's roles that hold the full-access wildcard.
+func (s *Service) wildcardRoles(t *tenantSnap) int {
+	n := 0
+	for _, r := range t.roles {
+		if hasWildcard(r.Permissions) {
+			n++
+		}
+	}
+	return n
+}
+
+func orDefault(s, d string) string {
+	if s == "" {
+		return d
+	}
+	return s
+}
+
+// DeleteRole removes a custom role. Built-in roles, roles other roles inherit
+// and roles still granted to someone cannot be removed.
+func (s *Service) DeleteRole(ctx context.Context, actor Actor, id string) error {
+	t := s.view(ctx, actor.Tenant)
+	r, ok := t.roles[id]
+	if !ok {
+		return Err(404, "ROLE_NOT_FOUND", "role not found")
+	}
+	if r.System {
+		return Err(409, "SYSTEM_ROLE", "built-in roles cannot be deleted")
+	}
+	for _, o := range t.roles {
+		if slices.Contains(o.Inherits, id) {
+			return Err(409, "ROLE_IN_USE", "role %q inherits it", o.ID)
+		}
+	}
+	var n int
+	_ = s.DB.GetContext(ctx, &n, `SELECT COUNT(*) FROM rbac_members WHERE tenant_id=? AND role_id=?`, actor.Tenant, id)
+	if n > 0 {
+		return Err(409, "ROLE_IN_USE", "%d account(s) hold it; revoke it first", n)
+	}
+	if err := s.holds(ctx, actor, r.Permissions); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM rbac_roles WHERE tenant_id=? AND id=?`, actor.Tenant, id); err != nil {
+		return err
+	}
+	_ = s.Audit.Append(ctx, actor.ID, "rbac.delete_role", id, map[string]any{"tenant": actor.Tenant})
+	if err := s.bump(ctx, actor.Tenant, actor.ID, "delete role "+id); err != nil {
+		return err
+	}
+	return s.reload(ctx)
+}
+
+// Grant gives an account of the actor's tenant an extra role. The actor must
+// hold everything the role grants.
+func (s *Service) Grant(ctx context.Context, actor Actor, accountID, roleID string) error {
+	t := s.view(ctx, actor.Tenant)
+	r, ok := t.roles[roleID]
+	if !ok {
+		return Err(404, "ROLE_NOT_FOUND", "role not found")
+	}
+	if s.AccountTenant != nil {
+		if tn, ok := s.AccountTenant(ctx, accountID); !ok || tn != actor.Tenant {
+			return Err(404, "ACCOUNT_NOT_FOUND", "no such account in your organisation")
+		}
+	}
+	var perms []Permission
+	for _, id := range expand(t, roleID) {
+		perms = append(perms, t.roles[id].Permissions...)
+	}
+	if err := s.holds(ctx, actor, perms); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO rbac_members (tenant_id, account_id, role_id, granted_by, granted_at) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`, actor.Tenant, accountID, r.ID, actor.ID, s.stamp()); err != nil {
+		return err
+	}
+	_ = s.Audit.Append(ctx, actor.ID, "rbac.grant", accountID, map[string]any{"tenant": actor.Tenant, "role": roleID})
+	if err := s.bump(ctx, actor.Tenant, actor.ID, fmt.Sprintf("grant %s", roleID)); err != nil {
+		return err
+	}
+	return s.reload(ctx)
+}
+
+// Revoke removes an extra role from an account of the actor's tenant.
+func (s *Service) Revoke(ctx context.Context, actor Actor, accountID, roleID string) error {
+	res, err := s.DB.ExecContext(ctx, `DELETE FROM rbac_members WHERE tenant_id=? AND account_id=? AND role_id=?`, actor.Tenant, accountID, roleID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return Err(404, "NOT_GRANTED", "that role is not granted to the account")
+	}
+	_ = s.Audit.Append(ctx, actor.ID, "rbac.revoke", accountID, map[string]any{"tenant": actor.Tenant, "role": roleID})
+	if err := s.bump(ctx, actor.Tenant, actor.ID, fmt.Sprintf("revoke %s", roleID)); err != nil {
+		return err
+	}
+	return s.reload(ctx)
+}
+
+func expand(t *tenantSnap, id string) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(string)
+	walk = func(x string) {
+		if seen[x] {
+			return
+		}
+		seen[x] = true
+		out = append(out, x)
+		for _, p := range t.roles[x].Inherits {
+			walk(p)
+		}
+	}
+	walk(id)
+	return out
+}
+
+// Members lists a tenant's extra role grants, optionally for one account.
+func (s *Service) Members(ctx context.Context, tenant, accountID string) ([]Member, error) {
+	q, args := `SELECT account_id, role_id, granted_by, granted_at FROM rbac_members WHERE tenant_id=?`, []any{tenant}
+	if accountID != "" {
+		q += ` AND account_id=?`
+		args = append(args, accountID)
+	}
+	out := []Member{}
+	err := s.DB.SelectContext(ctx, &out, q+` ORDER BY account_id, role_id`, args...)
+	return out, err
+}
+
+// Revision is one entry of a tenant's change history.
+type Revision struct {
+	Rev    int64  `db:"rev" json:"rev"`
+	Author string `db:"author" json:"author"`
+	Note   string `db:"note" json:"note"`
+	At     string `db:"at" json:"at"`
+}
+
+func (s *Service) History(ctx context.Context, tenant string) ([]Revision, error) {
+	out := []Revision{}
+	err := s.DB.SelectContext(ctx, &out, `SELECT rev, author, note, at FROM rbac_history WHERE tenant_id=? ORDER BY rev DESC LIMIT 100`, tenant)
+	return out, err
+}
+
+// Rollback restores the roles and grants of an earlier revision of the actor's
+// tenant as a new revision. The actor must hold everything the restored roles
+// grant, and the result must still contain a working administrator role. A
+// revision of another tenant is never found.
+func (s *Service) Rollback(ctx context.Context, actor Actor, rev int64) error {
+	var snapJSON string
+	if err := s.DB.GetContext(ctx, &snapJSON, `SELECT snapshot FROM rbac_history WHERE rev=? AND tenant_id=?`, rev, actor.Tenant); err != nil {
+		return Err(404, "REVISION_NOT_FOUND", "revision not found")
+	}
+	var snap struct {
+		Roles   []roleRow `json:"roles"`
+		Members []Member  `json:"members"`
+	}
+	if err := json.Unmarshal([]byte(snapJSON), &snap); err != nil {
+		return err
+	}
+	var all []Permission
+	adminOK := false
+	for _, row := range snap.Roles {
+		r, err := row.role()
+		if err != nil {
+			return err
+		}
+		all = append(all, r.Permissions...)
+		adminOK = adminOK || hasWildcard(r.Permissions)
+	}
+	if !adminOK {
+		return Err(409, "LOCKOUT", "that revision has no full-access role")
+	}
+	// Only what the snapshot would newly grant needs standing: restoring an
+	// earlier state must not hand out permissions the actor could not grant now.
+	cur := map[Permission]bool{}
+	for _, r := range s.view(ctx, actor.Tenant).roles {
+		for _, p := range r.Permissions {
+			cur[p] = true
+		}
+	}
+	var added []Permission
+	for _, p := range all {
+		if !cur[p] {
+			added = append(added, p)
+		}
+	}
+	if err := s.holds(ctx, actor, added); err != nil {
+		return err
+	}
+	tx, err := s.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM rbac_roles WHERE tenant_id=?`, actor.Tenant); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM rbac_members WHERE tenant_id=?`, actor.Tenant); err != nil {
+		return err
+	}
+	for _, row := range snap.Roles {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO rbac_roles (`+roleCols+`) VALUES (?,?,?,?,?,?,?,?)`, actor.Tenant, row.ID, row.Name, row.Permissions, row.Inherits, row.System, s.stamp(), actor.ID); err != nil {
+			return err
+		}
+	}
+	for _, m := range snap.Members {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO rbac_members (tenant_id, account_id, role_id, granted_by, granted_at) VALUES (?,?,?,?,?)`, actor.Tenant, m.AccountID, m.RoleID, m.GrantedBy, m.GrantedAt); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	_ = s.Audit.Append(ctx, actor.ID, "rbac.rollback", fmt.Sprint(rev), map[string]any{"tenant": actor.Tenant})
+	if err := s.bump(ctx, actor.Tenant, actor.ID, fmt.Sprintf("rollback to %d", rev)); err != nil {
+		return err
+	}
+	return s.reload(ctx)
+}
+
+// Denial is a refused decision.
+type Denial struct {
+	At       string `db:"at" json:"at"`
+	Subject  string `db:"subject" json:"subject"`
+	Action   string `db:"action" json:"action"`
+	Resource string `db:"resource" json:"resource"`
+	Reason   string `db:"reason" json:"reason"`
+}
+
+func (s *Service) Denials(ctx context.Context, tenant string, limit int) ([]Denial, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	out := []Denial{}
+	err := s.DB.SelectContext(ctx, &out, `SELECT at, subject, action, resource, reason FROM rbac_denials WHERE tenant_id=? ORDER BY at DESC LIMIT ?`, tenant, limit)
+	return out, err
+}
+
+// Catalog lists the permissions the platform's code checks, for the editor to
+// offer. A test (internal/httpapi) keeps it identical to the checks in the
+// handlers, so it never offers a permission that does nothing. Roles may still
+// be given others through the API, but nothing enforces them.
+// Catalog lists every permission the roles and modules know about.
+func (s *Service) Catalog() []Permission {
+	seen := map[Permission]bool{}
+	var out []Permission
+	add := func(p Permission) {
+		if !seen[p] && p.Action != "*" {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	for _, r := range s.defaults {
+		for _, p := range r.Permissions {
+			add(p)
+		}
+	}
+	for _, p := range s.declared {
+		add(p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Resource != out[j].Resource {
+			return out[i].Resource < out[j].Resource
+		}
+		return out[i].Action < out[j].Action
+	})
+	return out
+}

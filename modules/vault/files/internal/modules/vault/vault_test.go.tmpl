@@ -1,0 +1,101 @@
+package vault
+
+import (
+	"errors"
+	"testing"
+)
+
+func newTestVault(t *testing.T) (*Vault, *MemoryKMS, *MemoryKeyStore) {
+	t.Helper()
+	kms := RandomMemoryKMS()
+	ks := NewMemoryKeyStore()
+	return New(kms, ks), kms, ks
+}
+
+func TestRoundTrip(t *testing.T) {
+	v, _, _ := newTestVault(t)
+	enc, err := v.Encrypt("s1", "profiles", "data", "r1", []byte(`{"name":"Asha"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := v.Decrypt("s1", "profiles", "data", "r1", enc)
+	if err != nil || string(got) != `{"name":"Asha"}` {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func TestWrongAADRejected(t *testing.T) {
+	v, _, _ := newTestVault(t)
+	enc, _ := v.Encrypt("s1", "profiles", "data", "r1", []byte("x"))
+	for _, c := range [][3]string{{"profiles", "data", "r2"}, {"profiles", "other", "r1"}, {"documents", "data", "r1"}} {
+		if _, err := v.Decrypt("s1", c[0], c[1], c[2], enc); !errors.Is(err, ErrTampered) {
+			t.Fatalf("%v: want ErrTampered, got %v", c, err)
+		}
+	}
+}
+
+func TestTamperRejected(t *testing.T) {
+	v, _, _ := newTestVault(t)
+	enc, _ := v.Encrypt("s1", "t", "c", "r", []byte("secret"))
+	b := []byte(enc)
+	b[len(b)-2] ^= 1
+	if _, err := v.Decrypt("s1", "t", "c", "r", string(b)); err == nil {
+		t.Fatal("tampered ciphertext accepted")
+	}
+}
+
+func TestSubjectIsolation(t *testing.T) {
+	v, _, _ := newTestVault(t)
+	enc, _ := v.Encrypt("s1", "t", "c", "r", []byte("secret"))
+	v.Encrypt("s2", "t", "c", "r", []byte("other"))
+	if _, err := v.Decrypt("s2", "t", "c", "r", enc); err == nil {
+		t.Fatal("subject s2 decrypted s1 data")
+	}
+}
+
+func TestShred(t *testing.T) {
+	v, _, _ := newTestVault(t)
+	enc, _ := v.Encrypt("s1", "t", "c", "r", []byte("secret"))
+	if err := v.Shred("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Decrypt("s1", "t", "c", "r", enc); !errors.Is(err, ErrShredded) {
+		t.Fatalf("want ErrShredded, got %v", err)
+	}
+}
+
+func TestKeyRotation(t *testing.T) {
+	v, kms, ks := newTestVault(t)
+	enc, _ := v.Encrypt("s1", "t", "c", "r", []byte("secret"))
+	newKEK := make([]byte, 32)
+	newKEK[0] = 7
+	kms.AddVersion("dev-2", newKEK, true)
+	if err := v.Rewrap("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if wk, _, _ := ks.Get("s1"); wk.Version != "dev-2" {
+		t.Fatalf("not rewrapped: %s", wk.Version)
+	}
+	// A fresh vault (empty cache) must unwrap with the new version.
+	v2 := New(kms, ks)
+	got, err := v2.Decrypt("s1", "t", "c", "r", enc)
+	if err != nil || string(got) != "secret" {
+		t.Fatalf("after rotation: %q %v", got, err)
+	}
+}
+
+func TestBlindIndexNormalisation(t *testing.T) {
+	v, _, _ := newTestVault(t)
+	if v.BlindIndex("phone", "+977 980-123 4567") != v.BlindIndex("phone", "9779801234567") {
+		t.Fatal("phone normalisation")
+	}
+	if v.BlindIndex("email", " Asha@Example.COM ") != v.BlindIndex("email", "asha@example.com") {
+		t.Fatal("email normalisation")
+	}
+	if v.BlindIndex("doc_no", "ab-123 456") != v.BlindIndex("doc_no", "AB123456") {
+		t.Fatal("doc normalisation")
+	}
+	if v.BlindIndex("phone", "123") == v.BlindIndex("doc_no", "123") {
+		t.Fatal("namespaces must differ")
+	}
+}

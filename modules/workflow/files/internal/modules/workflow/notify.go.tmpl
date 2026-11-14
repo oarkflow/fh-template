@@ -1,0 +1,216 @@
+package workflow
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/oarkflow/ref/pipeline"
+	"github.com/oarkflow/squealx"
+)
+
+// Notifications turn workflow events into messages for people. The BCL files say
+// which events tell whom (`notify "case.returned" { to ["applicant"] ... }`); the
+// engine plans them (recipients, channels, quiet hours, digests); this file keeps
+// them durably and delivers what is due, retrying a failed delivery with backoff.
+
+// notifyStore keeps planned notifications and people's preferences in SQL. It
+// implements pipeline.NotifyStore.
+type notifyStore struct{ db *squealx.DB }
+
+var _ pipeline.NotifyStore = notifyStore{}
+
+func (s notifyStore) Preferences(ctx context.Context, tenant, user string) (*pipeline.NotifyPreferences, error) {
+	var doc string
+	if err := s.db.GetContext(ctx, &doc, `SELECT doc FROM notify_prefs WHERE tenant_id=? AND user_id=?`, tenant, user); err != nil {
+		if isNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var p pipeline.NotifyPreferences
+	if err := json.Unmarshal([]byte(doc), &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (s notifyStore) SetPreferences(ctx context.Context, p *pipeline.NotifyPreferences) error {
+	doc, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO notify_prefs (tenant_id, user_id, doc, updated_at) VALUES (?,?,?,?)
+		ON CONFLICT(tenant_id, user_id) DO UPDATE SET doc=excluded.doc, updated_at=excluded.updated_at`, p.TenantID, p.User, string(doc), p.UpdatedAt.UnixNano())
+	return err
+}
+
+func (s notifyStore) EnqueueNotifications(ctx context.Context, items []pipeline.Notification) error {
+	for _, n := range items {
+		doc, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO workflow_notifications (id, tenant_id, user_id, channel, digest, deliver_at, doc, created_at) VALUES (?,?,?,?,?,?,?,?)
+			ON CONFLICT(id) DO NOTHING`, n.ID, n.TenantID, n.User, n.Channel, n.Digest, n.DeliverAt.Unix(), string(doc), time.Now().UTC().Format(time.RFC3339)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s notifyStore) ClaimNotifications(ctx context.Context, limit int, lease time.Duration, now time.Time) ([]pipeline.Notification, error) {
+	var rows []struct {
+		ID       string `db:"id"`
+		Doc      string `db:"doc"`
+		Attempts int    `db:"attempts"`
+	}
+	if err := s.db.SelectContext(ctx, &rows, `SELECT id, doc, attempts FROM workflow_notifications WHERE status='pending' AND deliver_at <= ? AND leased_until <= ? ORDER BY deliver_at, id LIMIT ?`, now.Unix(), now.Unix(), limit); err != nil {
+		return nil, err
+	}
+	var out []pipeline.Notification
+	for _, r := range rows {
+		// Claim by lease: a second flusher skips what this one holds.
+		res, err := s.db.ExecContext(ctx, `UPDATE workflow_notifications SET leased_until=? WHERE id=? AND leased_until <= ?`, now.Add(lease).Unix(), r.ID, now.Unix())
+		if err != nil {
+			return nil, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			continue
+		}
+		var n pipeline.Notification
+		if err := json.Unmarshal([]byte(r.Doc), &n); err != nil {
+			continue
+		}
+		n.Attempts = r.Attempts
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func (s notifyStore) AckNotifications(ctx context.Context, ids []string) error {
+	for _, id := range ids {
+		if _, err := s.db.ExecContext(ctx, `UPDATE workflow_notifications SET status='sent', leased_until=0 WHERE id=?`, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s notifyStore) RetryNotifications(ctx context.Context, ids []string, next time.Time, dead bool, lastError string) error {
+	status := "pending"
+	if dead {
+		status = "dead"
+	}
+	for _, id := range ids {
+		if _, err := s.db.ExecContext(ctx, `UPDATE workflow_notifications SET status=?, attempts=attempts+1, deliver_at=?, leased_until=0, last_error=? WHERE id=?`, status, next.Unix(), lastError, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s notifyStore) PendingNotifications(ctx context.Context, tenant, user string, limit int) ([]pipeline.Notification, error) {
+	var docs []string
+	if err := s.db.SelectContext(ctx, &docs, `SELECT doc FROM workflow_notifications WHERE tenant_id=? AND user_id=? AND status='pending' ORDER BY deliver_at LIMIT ?`, tenant, user, limit); err != nil {
+		return nil, err
+	}
+	var out []pipeline.Notification
+	for _, d := range docs {
+		var n pipeline.Notification
+		if json.Unmarshal([]byte(d), &n) == nil {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// Channels the host delivers on. "inbox" is the in-app list; the others go
+// through the operator's delivery gateway.
+var Channels = []string{"inbox", "email", "sms"}
+
+// Hook is host code a workflow's `on "<event>" { hook "<name>" }` block runs.
+type Hook func(ctx context.Context, c *pipeline.Case, ev pipeline.Event) error
+
+// dispatch plans notifications and runs event hooks for what a saved operation
+// emitted. It never fails the operation: the case is already saved, and a
+// notification that cannot be planned is logged.
+func (s *Service) dispatch(ctx context.Context, e *pipeline.Engine, c *pipeline.Case) {
+	s.dispatchEvents(ctx, e, c, c.Events())
+}
+
+func (s *Service) dispatchEvents(ctx context.Context, e *pipeline.Engine, c *pipeline.Case, evs []pipeline.Event) {
+	if len(evs) == 0 {
+		return
+	}
+	store := notifyStore{s.DB}
+	prefs := func(user string) (*pipeline.NotifyPreferences, error) {
+		return store.Preferences(ctx, c.TenantID, user)
+	}
+	for i, ev := range evs {
+		eventID := fmt.Sprintf("%s:%d:%s:%d", c.ID, c.Revision, ev.Name, i)
+		ns, err := e.PlanNotifications(ctx, c, eventID, ev, Channels, prefs, s.Time())
+		if err != nil {
+			log.Printf("workflow: planning notifications for %s: %v", ev.Name, err)
+			continue
+		}
+		// A rule that names a role reaches every holder of it the directory knows;
+		// only people of the case's own organisation may be told about it.
+		keep := ns[:0]
+		for _, n := range ns {
+			if s.InTenant == nil || s.InTenant(ctx, n.User, c.TenantID) {
+				keep = append(keep, n)
+			}
+		}
+		if err := store.EnqueueNotifications(ctx, keep); err != nil {
+			log.Printf("workflow: storing notifications for %s: %v", ev.Name, err)
+		}
+		for _, h := range e.C.Def.On {
+			if !pipeline.EventMatches(h.Event, ev.Name) || (h.Stage != "" && h.Stage != ev.Stage) {
+				continue
+			}
+			if h.When != "" {
+				env := e.Env(c, pipeline.Actor{ID: ev.Actor})
+				env["event"] = map[string]any{"name": ev.Name, "stage": ev.Stage, "actor": ev.Actor, "detail": ev.Detail}
+				v, err := e.Eval.Eval(h.When, env)
+				if b, _ := v.(bool); err != nil || !b {
+					continue
+				}
+			}
+			hook, ok := s.Hooks[h.Hook]
+			if !ok {
+				log.Printf("workflow: event hook %q is not registered", h.Hook)
+				continue
+			}
+			if err := hook(ctx, c, ev); err != nil {
+				log.Printf("workflow: event hook %q for %s: %v", h.Hook, ev.Name, err)
+			}
+		}
+	}
+}
+
+// FlushNotifications delivers the notifications that are due. send delivers one
+// message (or one digest) on its channel; a failure is retried with backoff and
+// dead-lettered after five attempts.
+func (s *Service) FlushNotifications(ctx context.Context, send func(context.Context, pipeline.NotificationBatch) error) (int, error) {
+	return pipeline.FlushNotifications(ctx, notifyStore{s.DB}, s.Time(), 5, send)
+}
+
+// Preferences returns a person's notification preferences (nil when unset).
+func (s *Service) Preferences(ctx context.Context, tenant, user string) (*pipeline.NotifyPreferences, error) {
+	return notifyStore{s.DB}.Preferences(ctx, tenant, user)
+}
+
+// SetPreferences validates and saves a person's notification preferences.
+func (s *Service) SetPreferences(ctx context.Context, tenant, user string, p pipeline.NotifyPreferences) error {
+	p.User, p.TenantID, p.UpdatedAt = user, tenant, s.Time()
+	if p.Timezone == "" {
+		p.Timezone = "UTC"
+	}
+	if err := p.Validate(Channels); err != nil {
+		return err
+	}
+	return notifyStore{s.DB}.SetPreferences(ctx, &p)
+}

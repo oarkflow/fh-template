@@ -1,0 +1,8 @@
+// Package enabled lists the modules compiled into this application, in
+// dependency order. fh-init regenerates this file from the modules chosen with
+// -with; with none chosen the application has no optional features.
+package enabled
+
+import "__FH_MODULE__/internal/modules"
+
+func All() []modules.Module { return nil }

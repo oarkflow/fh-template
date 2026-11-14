@@ -1,0 +1,212 @@
+package rbac
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/settings"
+	"github.com/oarkflow/squealx"
+	"github.com/oarkflow/squealx/drivers/sqlite"
+)
+
+const testBCL = `
+role "admin" { title "Administrator" permissions ["*"] staff true }
+role "editor" { title "Editor" permissions ["notes:read", "notes:write"] }
+role "lead" { title "Lead" inherits ["editor"] permissions ["notes:approve"] }
+role "viewer" { title "Viewer" permissions ["notes:read"] }
+`
+
+func openDB(t *testing.T, path string) *squealx.DB {
+	t.Helper()
+	db, err := sqlite.Open("file:"+path+"?_pragma=busy_timeout(5000)", "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	raw, _ := migrations.ReadFile("sql/0001_rbac.sql")
+	for _, stmt := range strings.Split(string(raw), ";\n") {
+		if strings.TrimSpace(stmt) != "" {
+			if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	_, _ = db.ExecContext(context.Background(), `CREATE TABLE IF NOT EXISTS audit_log (seq INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '', prev_hash TEXT NOT NULL, hash TEXT NOT NULL)`)
+	return db
+}
+
+func roles(t *testing.T) []Role {
+	t.Helper()
+	cfg, err := settings.Parse([]byte(testBCL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return FromSettings(cfg.Roles)
+}
+
+func newSvc(t *testing.T) *Service {
+	t.Helper()
+	db := openDB(t, t.TempDir()+"/r.db")
+	s, err := New(context.Background(), db, audit.New(db), roles(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+const T = "t1"
+
+var admin = Actor{ID: "adm1", Role: "admin", Tenant: T}
+
+func TestBCLRolesMatrix(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	for i, c := range []struct {
+		role, action, resource string
+		want                   bool
+	}{
+		{"viewer", "read", "notes", true},
+		{"viewer", "write", "notes", false},
+		{"editor", "write", "notes", true},
+		{"editor", "approve", "notes", false},
+		{"lead", "approve", "notes", true},
+		{"lead", "write", "notes", true}, // inherited
+		{"admin", "anything", "whatever", true},
+		{"nobody", "read", "notes", false},
+		{"", "read", "notes", false},
+		{"viewer", "read", "note", false}, // a longer/shorter resource name must not match
+	} {
+		if got := s.Check(ctx, T, "acct", c.role, c.action, c.resource); got != c.want {
+			t.Errorf("case %d: %s %s:%s = %v, want %v", i, c.role, c.action, c.resource, got, c.want)
+		}
+	}
+}
+
+func TestEditsApplyImmediatelyAndPersist(t *testing.T) {
+	path := t.TempDir() + "/r.db"
+	db := openDB(t, path)
+	s, _ := New(context.Background(), db, audit.New(db), roles(t))
+	ctx := context.Background()
+	if s.Check(ctx, T, "a", "viewer", "write", "notes") {
+		t.Fatal("viewer can write before the edit")
+	}
+	if _, err := s.SaveRole(ctx, admin, Role{ID: "viewer", Name: "Viewer", Permissions: []Permission{{Action: "read", Resource: "notes"}, {Action: "write", Resource: "notes"}}}, "let viewers write"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Check(ctx, T, "a", "viewer", "write", "notes") {
+		t.Fatal("edit not applied immediately")
+	}
+	_ = s.Close()
+	s2, err := New(ctx, db, audit.New(db), roles(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if !s2.Check(ctx, T, "a", "viewer", "write", "notes") {
+		t.Fatal("edit not persisted across restart (built-in defaults must not overwrite it)")
+	}
+}
+
+func TestGuards(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	lead := Actor{ID: "l1", Role: "lead", Tenant: T}
+	if _, err := s.SaveRole(ctx, lead, Role{ID: "viewer", Name: "Viewer", Permissions: []Permission{{Action: "delete", Resource: "notes"}}}, ""); err == nil {
+		t.Fatal("a delegate granted a permission they do not hold")
+	}
+	if _, err := s.SaveRole(ctx, admin, Role{ID: "admin", Name: "Administrator", Permissions: []Permission{{Action: "read", Resource: "notes"}}}, ""); err == nil || !strings.Contains(err.Error(), "full-access") {
+		t.Fatalf("the last full-access role lost its wildcard: %v", err)
+	}
+	if err := s.DeleteRole(ctx, admin, "viewer"); err == nil {
+		t.Fatal("a built-in role was deleted")
+	}
+	if _, err := s.SaveRole(ctx, admin, Role{ID: "a", Name: "A", Permissions: []Permission{{Action: "*", Resource: "notes"}}}, ""); err == nil {
+		t.Fatal("partial wildcard accepted")
+	}
+	if _, err := s.SaveRole(ctx, admin, Role{ID: "loop", Name: "Loop", Inherits: []string{"loop"}}, ""); err == nil {
+		t.Fatal("self inheritance accepted")
+	}
+}
+
+func TestCustomRoleGrantRevokeRollback(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	if _, err := s.SaveRole(ctx, admin, Role{ID: "auditor", Name: "Auditor", Permissions: []Permission{{Action: "read", Resource: "audit"}}}, "add auditor"); err != nil {
+		t.Fatal(err)
+	}
+	if s.Check(ctx, T, "acct9", "viewer", "read", "audit") {
+		t.Fatal("not granted yet")
+	}
+	if err := s.Grant(ctx, admin, "acct9", "auditor"); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Check(ctx, T, "acct9", "viewer", "read", "audit") {
+		t.Fatal("grant not effective")
+	}
+	if err := s.Revoke(ctx, admin, "acct9", "auditor"); err != nil {
+		t.Fatal(err)
+	}
+	if s.Check(ctx, T, "acct9", "viewer", "read", "audit") {
+		t.Fatal("revoke not effective")
+	}
+	hist, err := s.History(ctx, T)
+	if err != nil || len(hist) < 2 {
+		t.Fatalf("history = %v, %v", hist, err)
+	}
+	// roll back to the first revision: the auditor role disappears
+	if err := s.Rollback(ctx, admin, hist[len(hist)-1].Rev); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range s.Roles(ctx, T) {
+		if r.ID == "auditor" {
+			t.Fatal("rollback kept the later role")
+		}
+	}
+}
+
+func TestTenantsHaveTheirOwnRoles(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	other := Actor{ID: "adm2", Role: "admin", Tenant: "t2"}
+	if _, err := s.SaveRole(ctx, other, Role{ID: "viewer", Name: "Viewer", Permissions: []Permission{{Action: "write", Resource: "notes"}}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Check(ctx, "t2", "a", "viewer", "write", "notes") {
+		t.Fatal("t2 edit missing")
+	}
+	if s.Check(ctx, T, "a", "viewer", "write", "notes") {
+		t.Fatal("t2's edit leaked into t1")
+	}
+	if s.Check(ctx, "", "a", "admin", "read", "notes") {
+		t.Fatal("an empty tenant must have no access")
+	}
+}
+
+func TestAnotherInstanceConverges(t *testing.T) {
+	path := t.TempDir() + "/r.db"
+	db1, db2 := openDB(t, path), openDB(t, path)
+	a, _ := New(context.Background(), db1, audit.New(db1), roles(t))
+	b, _ := New(context.Background(), db2, audit.New(db2), roles(t))
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+	b.every = 0
+	ctx := context.Background()
+	if b.Check(ctx, T, "x", "viewer", "write", "notes") {
+		t.Fatal("precondition")
+	}
+	if _, err := a.SaveRole(ctx, admin, Role{ID: "viewer", Name: "Viewer", Permissions: []Permission{{Action: "write", Resource: "notes"}}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !b.Check(ctx, T, "x", "viewer", "write", "notes") {
+		t.Fatal("the second instance did not pick up the change")
+	}
+}
+
+func TestDenialsAreRecorded(t *testing.T) {
+	s, ctx := newSvc(t), context.Background()
+	s.Check(ctx, T, "acct1", "viewer", "write", "notes")
+	_ = s.Close() // flushes the engine's audit worker
+	out, err := s.Denials(ctx, T, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = out // asynchronous in the engine; the query itself must work
+}

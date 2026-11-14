@@ -1,0 +1,57 @@
+package audit
+
+import (
+	"context"
+	"testing"
+
+	"github.com/oarkflow/squealx"
+	"github.com/oarkflow/squealx/drivers/sqlite"
+)
+
+func testLog(t *testing.T) (*Log, *squealx.DB) {
+	t.Helper()
+	db, err := sqlite.Open("file:"+t.TempDir()+"/a.db?_pragma=busy_timeout(5000)", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	raw, err := migrations.ReadFile("sql/0001_audit.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(context.Background(), string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	return New(db), db
+}
+
+func TestChainVerifyAndTamper(t *testing.T) {
+	l, db := testLog(t)
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		if err := l.Append(ctx, "u1", "profile.update", "s1", map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if bad, err := l.Verify(ctx); err != nil || bad != 0 {
+		t.Fatalf("bad=%d err=%v", bad, err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE audit_log SET actor='attacker' WHERE seq=3`); err != nil {
+		t.Fatal(err)
+	}
+	if bad, _ := l.Verify(ctx); bad != 3 {
+		t.Fatalf("expected tamper at 3, got %d", bad)
+	}
+}
+
+func TestDeletionDetected(t *testing.T) {
+	l, db := testLog(t)
+	ctx := context.Background()
+	for i := 0; i < 4; i++ {
+		_ = l.Append(ctx, "u", "a", "o", nil)
+	}
+	_, _ = db.ExecContext(ctx, `DELETE FROM audit_log WHERE seq=2`)
+	if bad, _ := l.Verify(ctx); bad == 0 {
+		t.Fatal("deleted row not detected")
+	}
+}

@@ -1,0 +1,201 @@
+package payments
+
+import (
+	"__FH_MODULE__/internal/modules"
+	"context"
+	"database/sql"
+	"errors"
+	"time"
+
+	"__FH_MODULE__/internal/modules/billing"
+)
+
+// Order states.
+const (
+	StatusPending = "pending"
+	StatusPaid    = "paid"
+)
+
+// Order is one top-up purchase.
+type Order struct {
+	ID          string `db:"id" json:"id"`
+	TenantID    string `db:"tenant_id" json:"-"`
+	CustomerID  string `db:"customer_id" json:"customerId"`
+	AccountID   string `db:"account_id" json:"-"`
+	Provider    string `db:"provider" json:"provider"`
+	Currency    string `db:"currency" json:"currency"`
+	Units       int64  `db:"units" json:"units"`
+	UnitMinor   int64  `db:"unit_minor" json:"unitMinor"`
+	AmountMinor int64  `db:"amount_minor" json:"amountMinor"`
+	Status      string `db:"status" json:"status"`
+	ClaimedAt   string `db:"claimed_at" json:"-"`
+	PaidAt      string `db:"paid_at" json:"paidAt,omitempty"`
+	GatewayTxn  string `db:"gateway_txn" json:"gatewayTxn,omitempty"`
+	CreatedAt   string `db:"created_at" json:"createdAt"`
+	ExpiresAt   string `db:"expires_at" json:"expiresAt"`
+}
+
+const orderCols = `id, tenant_id, customer_id, account_id, provider, currency, units, unit_minor, amount_minor, status, claimed_at, paid_at, gateway_txn, created_at, expires_at`
+
+// Service opens orders and settles them from the gateway's return.
+type Service struct {
+	billing.Deps
+	Gateway Gateway
+	Cfg     Config
+	Billing *billing.Service
+	// Notify tells a business account that money arrived.
+	Notify func(accountID, kind, body string)
+}
+
+// New builds the service. gateway may be nil: online payment is then off.
+func New(d billing.Deps, cfg Config, gw Gateway, b *billing.Service) *Service {
+	return &Service{Deps: d, Cfg: cfg.WithDefaults(), Gateway: gw, Billing: b}
+}
+
+// Info describes what a business can buy.
+type Info struct {
+	Available bool   `json:"available"`
+	Provider  string `json:"provider,omitempty"`
+	Currency  string `json:"currency,omitempty"`
+	UnitMinor int64  `json:"unitMinor,omitempty"`
+	MinUnits  int64  `json:"minUnits,omitempty"`
+	MaxUnits  int64  `json:"maxUnits,omitempty"`
+}
+
+func (s *Service) Info() Info {
+	if s.Gateway == nil {
+		return Info{}
+	}
+	return Info{Available: true, Provider: s.Gateway.Name(), Currency: s.Cfg.Currency, UnitMinor: s.Cfg.UnitMinor, MinUnits: s.Cfg.MinUnits, MaxUnits: s.Cfg.MaxUnits}
+}
+
+// Checkout is what the console needs to send the payer to the gateway.
+type Checkout struct {
+	OrderID     string `json:"orderId"`
+	URL         string `json:"url"`
+	Units       int64  `json:"units"`
+	AmountMinor int64  `json:"amountMinor"`
+	Currency    string `json:"currency"`
+}
+
+var ErrDisabled = billing.Err(503, "PAYMENTS_OFF", "online payment is not set up; ask the platform administrator to record your payment")
+
+// Start opens an order for `units` top-up packs and returns the payment link.
+func (s *Service) Start(ctx context.Context, tenant, customerID, accountID string, units int64) (Checkout, error) {
+	if s.Gateway == nil {
+		return Checkout{}, ErrDisabled
+	}
+	if units < s.Cfg.MinUnits || units > s.Cfg.MaxUnits {
+		return Checkout{}, billing.Err(400, "INVALID_QUANTITY", "buy between %d and %d packs", s.Cfg.MinUnits, s.Cfg.MaxUnits)
+	}
+	now := s.Time()
+	o := Order{ID: "ord_" + modules.NewID()[:20], TenantID: tenant, CustomerID: customerID, AccountID: accountID, Provider: s.Gateway.Name(),
+		Currency: s.Cfg.Currency, Units: units, UnitMinor: s.Cfg.UnitMinor, AmountMinor: units * s.Cfg.UnitMinor, Status: StatusPending,
+		CreatedAt: now.UTC().Format(time.RFC3339), ExpiresAt: now.Add(s.Cfg.OrderLife).UTC().Format(time.RFC3339)}
+	// Built before the order is stored: a bad link template must not leave orders behind.
+	link, err := s.Gateway.Link(LinkOrder{Reference: o.ID, Quantity: units, Redirect: s.Cfg.ReturnURL})
+	if err != nil {
+		return Checkout{}, billing.Err(503, "PAYMENTS_MISCONFIGURED", "%v", err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO pay_orders (`+orderCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		o.ID, o.TenantID, o.CustomerID, o.AccountID, o.Provider, o.Currency, o.Units, o.UnitMinor, o.AmountMinor, o.Status, "", "", "", o.CreatedAt, o.ExpiresAt); err != nil {
+		return Checkout{}, err
+	}
+	_ = s.Audit.Append(ctx, accountID, "payment.start", customerID, map[string]any{"order": o.ID, "units": units, "amount": o.AmountMinor})
+	return Checkout{OrderID: o.ID, URL: link, Units: units, AmountMinor: o.AmountMinor, Currency: o.Currency}, nil
+}
+
+// Result is the verified outcome of a return.
+type Result struct {
+	Status      string `json:"status"` // paid | pending | failed
+	OrderID     string `json:"orderId"`
+	CustomerID  string `json:"customerId,omitempty"`
+	AmountMinor int64  `json:"amountMinor,omitempty"`
+	Currency    string `json:"currency,omitempty"`
+}
+
+// Complete verifies a return and, once per order, credits the balance. Every
+// way a return can be wrong gives the same error. A repeat of a paid return
+// reports "paid" again and adds nothing.
+func (s *Service) Complete(ctx context.Context, rawQuery string) (Result, error) {
+	if s.Gateway == nil {
+		return Result{}, ErrReturn
+	}
+	now := s.Time()
+	rc, err := s.Gateway.Verify(rawQuery, now)
+	if err != nil {
+		return Result{}, ErrReturn
+	}
+	var o Order
+	if err := s.DB.GetContext(ctx, &o, `SELECT `+orderCols+` FROM pay_orders WHERE id=?`, rc.Reference); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Result{}, ErrReturn
+		}
+		return Result{}, err
+	}
+	res := Result{OrderID: o.ID, CustomerID: o.CustomerID, AmountMinor: o.AmountMinor, Currency: o.Currency}
+	if o.Status == StatusPaid {
+		res.Status = StatusPaid // a refresh or a replay
+		return res, nil
+	}
+	if exp, _ := time.Parse(time.RFC3339, o.ExpiresAt); !exp.After(now) {
+		return Result{}, ErrReturn
+	}
+	switch rc.Status {
+	case "pending":
+		res.Status = "pending"
+		return res, nil
+	case "paid":
+	default:
+		res.Status = "failed"
+		return res, nil
+	}
+	// The signed rate, quantity, total and currency must be exactly what this
+	// server asked for. Anything else is a tampered or foreign return.
+	if rc.Currency != o.Currency || rc.UnitMinor != o.UnitMinor || rc.Quantity != o.Units || rc.TotalMinor != o.AmountMinor || o.UnitMinor*o.Units != o.AmountMinor {
+		return Result{}, ErrReturn
+	}
+	// Claim the order so two returns racing each other credit once. A claim that
+	// was never finished (a crash mid-credit) is retried after two minutes.
+	stale := now.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	claim, err := s.DB.ExecContext(ctx, `UPDATE pay_orders SET claimed_at=? WHERE id=? AND status<>'paid' AND (claimed_at='' OR claimed_at < ?)`, now.UTC().Format(time.RFC3339), o.ID, stale)
+	if err != nil {
+		return Result{}, err
+	}
+	if n, _ := claim.RowsAffected(); n != 1 {
+		res.Status = "pending"
+		return res, nil
+	}
+	if err := s.Billing.EnsureAccount(ctx, "gateway:"+s.Gateway.Name(), o.CustomerID, o.Currency); err != nil {
+		s.unclaim(ctx, o.ID)
+		return Result{}, err
+	}
+	// The ledger reference makes the credit idempotent even if marking the order paid fails below.
+	if _, err := s.Billing.TopUp(ctx, "gateway:"+s.Gateway.Name(), o.CustomerID, o.Currency, o.AmountMinor, "pay:"+o.ID); err != nil {
+		s.unclaim(ctx, o.ID)
+		return Result{}, err
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE pay_orders SET status='paid', paid_at=?, gateway_txn=? WHERE id=?`, now.UTC().Format(time.RFC3339), rc.TransactionID, o.ID); err != nil {
+		return Result{}, err
+	}
+	_ = s.Audit.Append(ctx, "gateway:"+s.Gateway.Name(), "payment.paid", o.CustomerID, map[string]any{"order": o.ID, "amount": o.AmountMinor, "txn": rc.TransactionID})
+	if s.Notify != nil {
+		s.Notify(o.AccountID, "billing.paid", "Payment received: your balance was topped up.")
+	}
+	res.Status = StatusPaid
+	return res, nil
+}
+
+func (s *Service) unclaim(ctx context.Context, id string) {
+	_, _ = s.DB.ExecContext(context.WithoutCancel(ctx), `UPDATE pay_orders SET claimed_at='' WHERE id=? AND status<>'paid'`, id)
+}
+
+// Orders lists a customer's recent orders.
+func (s *Service) Orders(ctx context.Context, customerID string, limit int) ([]Order, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	out := []Order{}
+	err := s.DB.SelectContext(ctx, &out, `SELECT `+orderCols+` FROM pay_orders WHERE customer_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?`, customerID, limit)
+	return out, err
+}

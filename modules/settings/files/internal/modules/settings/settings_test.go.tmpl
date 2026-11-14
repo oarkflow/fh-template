@@ -1,0 +1,74 @@
+package settings
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestDefaultsAreValid(t *testing.T) {
+	s := Defaults()
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if s.MultiTenant() || s.Tenant("acme") != "default" {
+		t.Fatalf("single tenant must ignore the requested tenant: %q", s.Tenant("acme"))
+	}
+	if !s.Allows([]string{"admin"}, "anything:at-all") || s.Allows([]string{"viewer"}, "notes:write") || !s.Allows([]string{"viewer"}, "notes:read") {
+		t.Fatal("default role permissions are wrong")
+	}
+}
+
+func TestParseFullDocument(t *testing.T) {
+	s, err := Parse([]byte(`
+tenancy { mode "multi" default "acme" }
+role "owner" { permissions ["*"] staff true }
+role "member" { permissions ["docs:read"] }
+role "lead" { permissions ["docs:write"] inherits ["member"] }
+registration { enabled true default_role "member" }
+datasource "local" { kind "builtin" }
+datasource "ext" {
+  kind "sql"
+  hash "bcrypt"
+  lookup "SELECT id, pw FROM users WHERE email = ?"
+  columns { id "id" password "pw" }
+}
+auth { sources ["ext", "local"] lockout { max_failures 3 } mfa { totp "required" } }
+vault { backend "secretr" }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.MultiTenant() || s.Tenant("globex") != "globex" || s.Tenant("") != "acme" {
+		t.Fatal("tenant resolution")
+	}
+	if !s.Allows([]string{"lead"}, "docs:read") || !s.Allows([]string{"lead"}, "docs:write") || s.Allows([]string{"member"}, "docs:write") {
+		t.Fatal("inheritance")
+	}
+	if s.Auth.Lockout.MaxFailures != 3 || s.Auth.Lockout.LockMinutes != 15 || s.Auth.MFA.TOTP != "required" || s.Vault.Backend != "secretr" {
+		t.Fatalf("auth/vault = %+v %+v", s.Auth, s.Vault)
+	}
+}
+
+func TestValidationRejects(t *testing.T) {
+	cases := map[string]string{
+		`tenancy { mode "many" }`:                                  "tenancy.mode",
+		`role "a" { permissions ["x:y"] }`:                          `"*" permission`,
+		`role "a" { permissions ["*"] } role "a" { permissions ["*"] }`: "twice",
+		`auth { sources ["nope"] }`:                                 "unknown datasource",
+		`role "a" { permissions ["*", "notes:*"] }`:                 "resource:action",
+		`datasource "x" { kind "ldap" }`:                            "unknown kind",
+		`datasource "x" { kind "sql" }`:                             "needs lookup",
+		`role "a" { permissions ["*"] inherits ["ghost"] } registration { default_role "a" }`: "unknown role",
+	}
+	for src, want := range cases {
+		if _, err := Parse([]byte(src)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s\n  err = %v, want %q", src, err, want)
+		}
+	}
+}
+
+func TestGrants(t *testing.T) {
+	if Grants([]string{"notes:*"}, "notes:write") || !Grants([]string{"notes:write"}, "notes:write") || !Grants([]string{"*"}, "x:y") {
+		t.Fatal("wildcards")
+	}
+}

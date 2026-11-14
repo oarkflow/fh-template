@@ -1,0 +1,6 @@
+{
+  "name": "audit",
+  "description": "Append-only, hash-chained audit log with tamper verification and admin endpoints (GET /api/audit, GET /api/audit/verify, needing audit:read).",
+  "requires": [],
+  "package": "internal/modules/audit"
+}

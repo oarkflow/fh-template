@@ -1,0 +1,142 @@
+package payments
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"math"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Orgware is the Orgware payment-link gateway (orgware.store/pay/<link>). A
+// return carries a signature over a sorted set of named fields; only fields the
+// signature covers are believed.
+type Orgware struct{ cfg Config }
+
+const orgwareContext = "orgware.paylink.return.v2"
+
+// Fields every genuine return signs.
+var orgwareRequired = []string{"app", "orderId", "status", "amount", "quantity", "unitAmount", "currency", "timestamp", "nonce", "keyId", "signatureVersion", "signatureAlgorithm"}
+
+func (*Orgware) Name() string { return "orgware" }
+
+func (g *Orgware) Link(o LinkOrder) (string, error) {
+	return buildLink(g.cfg.LinkURL, o, g.cfg.UnitMinor*o.Quantity, g.cfg.Currency, g.cfg.App)
+}
+
+func (g *Orgware) Verify(rawQuery string, now time.Time) (Receipt, error) {
+	signed, ok := verifyOrgware(g.cfg.ReturnSecret, rawQuery, now, g.cfg.MaxAge)
+	if !ok || signed["app"] != g.cfg.App {
+		return Receipt{}, ErrReturn
+	}
+	ref := signed["reference"] // this server always sends one, so it must be signed
+	if ref == "" {
+		return Receipt{}, ErrReturn
+	}
+	unit, e1 := strconv.ParseInt(signed["unitAmount"], 10, 64)
+	qty, e2 := strconv.ParseInt(signed["quantity"], 10, 64)
+	total, e3 := strconv.ParseInt(signed["amount"], 10, 64)
+	if e1 != nil || e2 != nil || e3 != nil {
+		return Receipt{}, ErrReturn
+	}
+	status := "failed"
+	switch strings.ToLower(strings.TrimSpace(signed["status"])) {
+	case "completed":
+		status = "paid"
+	case "pending":
+		status = "pending"
+	}
+	return Receipt{Reference: ref, Status: status, TransactionID: signed["transactionId"], Currency: signed["currency"], UnitMinor: unit, Quantity: qty, TotalMinor: total}, nil
+}
+
+// rfc3986 percent-encodes everything except A-Z a-z 0-9 - _ . ~ (upper-case hex).
+func rfc3986(s string) string {
+	const hexd = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '~' {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('%')
+			b.WriteByte(hexd[c>>4])
+			b.WriteByte(hexd[c&15])
+		}
+	}
+	return b.String()
+}
+
+// verifyOrgware checks a return from its RAW query string (so repeated
+// parameters stay visible) and returns only the signed values.
+func verifyOrgware(secret, rawQuery string, now time.Time, maxAge time.Duration) (map[string]string, bool) {
+	values, err := url.ParseQuery(strings.TrimPrefix(rawQuery, "?"))
+	if err != nil || secret == "" {
+		return nil, false
+	}
+	if len(values["signature"]) != 1 || len(values["signedFields"]) != 1 {
+		return nil, false
+	}
+	names := strings.Split(values.Get("signedFields"), ",")
+	if !sort.StringsAreSorted(names) {
+		return nil, false
+	}
+	signed := map[string]string{}
+	for i, n := range names {
+		if n == "" || (i > 0 && names[i-1] == n) || n == "signature" || n == "signedFields" || len(values[n]) != 1 {
+			return nil, false
+		}
+		signed[n] = values.Get(n)
+	}
+	for _, r := range orgwareRequired {
+		if _, ok := signed[r]; !ok {
+			return nil, false
+		}
+	}
+	if signed["signatureVersion"] != "2" || signed["signatureAlgorithm"] != "HMAC-SHA256" {
+		return nil, false
+	}
+	pairs := make([]string, 0, len(names))
+	for _, n := range names {
+		pairs = append(pairs, rfc3986(n)+"="+rfc3986(signed[n]))
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(orgwareContext + "\n" + strings.Join(names, ",") + "\n" + strings.Join(pairs, "&")))
+	got, err := hex.DecodeString(strings.ToLower(values.Get("signature")))
+	if err != nil || subtle.ConstantTimeCompare(got, mac.Sum(nil)) != 1 {
+		return nil, false
+	}
+	stamp, err := strconv.ParseInt(signed["timestamp"], 10, 64)
+	if err != nil || math.Abs(float64(now.Unix()-stamp)) > maxAge.Seconds() {
+		return nil, false
+	}
+	return signed, true
+}
+
+// SignReturn builds a query string signed the way the gateway signs its
+// returns. It exists for tests and for a local sandbox that plays the gateway;
+// production never holds a signing key it did not receive from the gateway.
+func SignReturn(secret string, fields map[string]string) string {
+	names := make([]string, 0, len(fields))
+	for k := range fields {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	pairs := make([]string, 0, len(names))
+	for _, n := range names {
+		pairs = append(pairs, rfc3986(n)+"="+rfc3986(fields[n]))
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(orgwareContext + "\n" + strings.Join(names, ",") + "\n" + strings.Join(pairs, "&")))
+	q := url.Values{}
+	for k, x := range fields {
+		q.Set(k, x)
+	}
+	q.Set("signedFields", strings.Join(names, ","))
+	q.Set("signature", hex.EncodeToString(mac.Sum(nil)))
+	return "?" + q.Encode()
+}

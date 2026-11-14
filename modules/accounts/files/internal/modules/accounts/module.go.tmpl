@@ -1,0 +1,238 @@
+package accounts
+
+import (
+	"context"
+	"embed"
+	"encoding/json"
+	"io/fs"
+	"log"
+	"os"
+	"strings"
+
+	appauth "__FH_MODULE__/internal/auth"
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/settings"
+	"__FH_MODULE__/internal/modules/vault"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/fh/mw/contract"
+)
+
+//go:embed sql/*.sql
+var migrations embed.FS
+
+// ServiceName is the key for modules.Service[*Service].
+const ServiceName = "accounts"
+
+type module struct{}
+
+// Module returns the accounts module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string { return ServiceName }
+
+func (module) Migrations() fs.FS {
+	sub, _ := fs.Sub(migrations, "sql")
+	return sub
+}
+
+var jsonBody = contract.New(contract.Config{Methods: []string{"POST", "PATCH"}, ContentTypes: []string{"application/json"}, MaxBodyBytes: 16 << 10})
+
+func (module) Register(ctx context.Context, d *modules.Deps) error {
+	cfg, err := modules.Service[*settings.Settings](d, settings.ServiceName)
+	if err != nil {
+		return err
+	}
+	v, err := modules.Service[*vault.Vault](d, vault.ServiceName)
+	if err != nil {
+		return err
+	}
+	al, err := modules.Service[*audit.Log](d, audit.ServiceName)
+	if err != nil {
+		return err
+	}
+
+	var notifier Notifier
+	switch url := os.Getenv("APP_NOTIFY_URL"); {
+	case url != "":
+		notifier = HTTPNotifier{URL: url, Token: os.Getenv("APP_NOTIFY_TOKEN")}
+	case !d.Config.Production:
+		notifier = NewDevNotifier()
+	}
+	svc := New(d.DB, v, al, cfg, notifier, Params{})
+	d.Provide(ServiceName, svc)
+
+	sources, err := buildSources(cfg, svc, d.DB)
+	if err != nil {
+		return err
+	}
+	appauth.SetVerifier(NewVerifier(svc, sources))
+
+	if email, pw := os.Getenv("APP_BOOTSTRAP_EMAIL"), os.Getenv("APP_BOOTSTRAP_PASSWORD"); email != "" && pw != "" {
+		if created, err := svc.Bootstrap(ctx, cfg.Tenancy.Default, email, pw); err != nil {
+			return err
+		} else if created {
+			log.Printf("accounts: created the first administrator %s", email)
+		}
+	}
+
+	registerPublic(d, svc, cfg)
+	d.DeclarePermissions("accounts:read", "accounts:write")
+	registerAccount(d, svc)
+	registerAdmin(d, svc, cfg)
+	return nil
+}
+
+func decode(c fh.Ctx, into any) error {
+	if err := json.Unmarshal(c.BodyCopy(), into); err != nil {
+		return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_JSON", "invalid JSON")
+	}
+	return nil
+}
+
+func registerPublic(d *modules.Deps, svc *Service, cfg *settings.Settings) {
+	d.App.Post("/auth/register", jsonBody, func(c fh.Ctx) error {
+		if !d.SameOrigin(c) {
+			return fh.NewHTTPError(fh.StatusForbidden, "ORIGIN_REJECTED", "same-origin registration required")
+		}
+		var in struct {
+			Email    string `json:"email"`
+			Phone    string `json:"phone"`
+			Name     string `json:"name"`
+			Password string `json:"password"`
+			Tenant   string `json:"tenant"`
+		}
+		if err := decode(c, &in); err != nil {
+			return err
+		}
+		id, code, err := svc.Register(c.Context(), in.Tenant, Contact{Email: strings.TrimSpace(in.Email), Phone: strings.TrimSpace(in.Phone)}, in.Name, in.Password)
+		if err != nil {
+			return err
+		}
+		out := fh.Map{"accountId": id, "verify": cfg.Registration.Verify != "none"}
+		if !d.Config.Production && code != "" {
+			out["devCode"] = code // never returned in production
+		}
+		return c.Status(fh.StatusCreated).JSON(out)
+	}).Name("register").Tag("authentication")
+
+	d.App.Post("/auth/verify", jsonBody, func(c fh.Ctx) error {
+		if !d.SameOrigin(c) {
+			return fh.NewHTTPError(fh.StatusForbidden, "ORIGIN_REJECTED", "same-origin verification required")
+		}
+		var in struct {
+			AccountID string `json:"accountId"`
+			Code      string `json:"code"`
+		}
+		if err := decode(c, &in); err != nil {
+			return err
+		}
+		if err := svc.VerifyOTP(c.Context(), in.AccountID, "register", in.Code); err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"verified": true})
+	}).Name("verify").Tag("authentication")
+}
+
+// registerAccount: what a signed-in person can do to their own account.
+func registerAccount(d *modules.Deps, svc *Service) {
+	d.API.Get("/account", func(c fh.Ctx) error {
+		p, _ := appauth.Principal(c)
+		out := fh.Map{"id": p.ID, "roles": p.Roles, "tenant": p.TenantID, "mfa": svc.Settings.Auth.MFA.TOTP}
+		if a, err := svc.Get(c.Context(), p.ID); err == nil {
+			out["builtin"], out["totpEnabled"], out["name"] = true, a.TOTPEnabled == 1, a.Name
+		}
+		return c.JSON(out)
+	}).Name("account").Tag("accounts")
+
+	d.API.Post("/account/totp/begin", func(c fh.Ctx) error {
+		p, _ := appauth.Principal(c)
+		secret, uri, err := svc.BeginTOTP(c.Context(), p.ID)
+		if err != nil {
+			return fh.NewHTTPError(fh.StatusBadRequest, "TOTP_UNAVAILABLE", "authenticator setup is only available for built-in accounts")
+		}
+		return c.JSON(fh.Map{"secret": secret, "uri": uri})
+	}).Name("totp-begin").Tag("accounts")
+
+	d.API.Post("/account/totp/confirm", jsonBody, func(c fh.Ctx) error {
+		p, _ := appauth.Principal(c)
+		var in struct {
+			Code string `json:"code"`
+		}
+		if err := decode(c, &in); err != nil {
+			return err
+		}
+		if err := svc.ConfirmTOTP(c.Context(), p.ID, in.Code); err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"totpEnabled": true})
+	}).Name("totp-confirm").Tag("accounts")
+
+	d.API.Post("/account/password", jsonBody, func(c fh.Ctx) error {
+		p, _ := appauth.Principal(c)
+		var in struct {
+			Current string `json:"current"`
+			Next    string `json:"next"`
+		}
+		if err := decode(c, &in); err != nil {
+			return err
+		}
+		if err := svc.ChangePassword(c.Context(), p.ID, in.Current, in.Next); err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"changed": true})
+	}).Name("password-change").Tag("accounts")
+}
+
+// registerAdmin: managing everyone's accounts, gated by accounts:* permissions.
+func registerAdmin(d *modules.Deps, svc *Service, cfg *settings.Settings) {
+	d.API.Get("/accounts", d.Require("accounts:read"), func(c fh.Ctx) error {
+		p, _ := appauth.Principal(c)
+		list, err := svc.List(c.Context(), tenantOf(cfg, p.TenantID))
+		if err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "ACCOUNTS_LIST_FAILED", "could not list accounts")
+		}
+		return c.JSON(fh.Map{"accounts": list, "roles": cfg.Roles})
+	}).Name("accounts-list").Tag("accounts")
+
+	d.API.Post("/accounts", d.Require("accounts:write"), jsonBody, func(c fh.Ctx) error {
+		p, _ := appauth.Principal(c)
+		var in struct {
+			Email    string `json:"email"`
+			Phone    string `json:"phone"`
+			Name     string `json:"name"`
+			Password string `json:"password"`
+			Role     string `json:"role"`
+		}
+		if err := decode(c, &in); err != nil {
+			return err
+		}
+		a, err := svc.CreateAccount(c.Context(), p.ID, tenantOf(cfg, p.TenantID), Contact{Email: in.Email, Phone: in.Phone}, in.Name, in.Password, in.Role)
+		if err != nil {
+			return err
+		}
+		return c.Status(fh.StatusCreated).JSON(a)
+	}).Name("accounts-create").Tag("accounts")
+
+	d.API.Patch("/accounts/:id", d.Require("accounts:write"), jsonBody, func(c fh.Ctx) error {
+		p, _ := appauth.Principal(c)
+		var in struct {
+			Role   *string `json:"role"`
+			Status *string `json:"status"`
+		}
+		if err := decode(c, &in); err != nil {
+			return err
+		}
+		if err := svc.Update(c.Context(), p.ID, tenantOf(cfg, p.TenantID), c.Param("id"), in.Role, in.Status); err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"updated": true})
+	}).Name("accounts-update").Tag("accounts")
+}
+
+func tenantOf(cfg *settings.Settings, fromSession string) string {
+	if cfg.MultiTenant() && fromSession != "" {
+		return fromSession
+	}
+	return cfg.Tenancy.Default
+}

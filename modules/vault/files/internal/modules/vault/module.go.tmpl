@@ -1,0 +1,150 @@
+package vault
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"database/sql"
+	"embed"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"strings"
+	"time"
+
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/objects"
+	"__FH_MODULE__/internal/modules/settings"
+	"github.com/oarkflow/squealx"
+)
+
+//go:embed sql/*.sql
+var migrations embed.FS
+
+// Service names for modules.Service.
+const (
+	ServiceName = "vault"
+	ObjectsName = "objects"
+	KMSName     = "kms" // the active KMS; *Secretr supports Rotate
+)
+
+type module struct{}
+
+// Module returns the vault module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string { return ServiceName }
+
+func (module) Migrations() fs.FS {
+	sub, _ := fs.Sub(migrations, "sql")
+	return sub
+}
+
+// Register publishes "vault" (*Vault) and "objects" (objects.Store).
+func (module) Register(_ context.Context, d *modules.Deps) error {
+	cfg, err := modules.Service[*settings.Settings](d, settings.ServiceName)
+	if err != nil {
+		return err
+	}
+	master, err := masterKey(d.Config.Production)
+	if err != nil {
+		return err
+	}
+	var kms KMS
+	switch cfg.Vault.Backend {
+	case "secretr":
+		// Key-encryption and blind-index keys live in an encrypted secretr store
+		// under vault.dir; only the master key (APP_VAULT_KEY) is held outside it.
+		open, ok := backends["secretr"]
+		if !ok {
+			return errors.New("vault: vault.backend \"secretr\" needs the vault-secretr module (fh-init -with vault-secretr)")
+		}
+		if len(master) != 32 {
+			return errors.New("vault: the secretr backend needs APP_VAULT_KEY")
+		}
+		kms, err = open(cfg.Vault.Dir, master)
+	default:
+		kms, err = NewMemoryKMS("kek-1", derive(master, "kek"), derive(master, "index"))
+	}
+	if err != nil {
+		return err
+	}
+	d.Provide(ServiceName, New(kms, DBKeyStore{DB: d.DB}))
+	d.Provide(KMSName, kms)
+	dir := os.Getenv("APP_OBJECTS_DIR")
+	if dir == "" {
+		dir = "data/objects"
+	}
+	d.Provide(ObjectsName, objects.FS{Root: dir})
+	return nil
+}
+
+// masterKey reads APP_VAULT_KEY (or APP_VAULT_KEY_FILE). Production refuses to
+// start without one; development falls back to a per-process random key.
+func masterKey(production bool) ([]byte, error) {
+	value := strings.TrimSpace(os.Getenv("APP_VAULT_KEY"))
+	if file := os.Getenv("APP_VAULT_KEY_FILE"); value == "" && file != "" {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("vault: read APP_VAULT_KEY_FILE: %w", err)
+		}
+		value = strings.TrimSpace(string(raw))
+	}
+	if value == "" {
+		if production {
+			return nil, errors.New("vault: APP_VAULT_KEY is required in production")
+		}
+		return RandomMemoryKMS().IndexKey(), nil
+	}
+	key, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(key) != 32 {
+		return nil, errors.New("vault: APP_VAULT_KEY must be 32 random bytes, base64url encoded")
+	}
+	return key, nil
+}
+
+func derive(master []byte, label string) []byte {
+	m := hmac.New(sha256.New, master)
+	m.Write([]byte("fh/vault/" + label))
+	return m.Sum(nil)
+}
+
+// DBKeyStore persists wrapped data keys in the key_store table.
+type DBKeyStore struct{ DB *squealx.DB }
+
+func (k DBKeyStore) Get(id string) (WrappedKey, bool, error) {
+	var row struct {
+		Version string `db:"version"`
+		Blob    []byte `db:"blob"`
+	}
+	err := k.DB.GetContext(context.Background(), &row, `SELECT version, blob FROM key_store WHERE subject_id = ?`, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WrappedKey{}, false, nil
+	}
+	if err != nil {
+		return WrappedKey{}, false, err
+	}
+	return WrappedKey{Version: row.Version, Blob: row.Blob}, true, nil
+}
+
+func (k DBKeyStore) Put(id string, w WrappedKey) error {
+	_, err := k.DB.ExecContext(context.Background(), `INSERT INTO key_store (subject_id, version, blob, created_at) VALUES (?,?,?,?)
+		ON CONFLICT(subject_id) DO UPDATE SET version=excluded.version, blob=excluded.blob`, id, w.Version, w.Blob, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func (k DBKeyStore) Delete(id string) error {
+	_, err := k.DB.ExecContext(context.Background(), `DELETE FROM key_store WHERE subject_id = ?`, id)
+	return err
+}
+
+// Backend opens a KMS rooted at dir and protected by a 32-byte master key.
+type Backend func(dir string, masterKey []byte) (KMS, error)
+
+var backends = map[string]Backend{}
+
+// RegisterBackend lets an optional module (vault-secretr) supply a KMS selected
+// by vault.backend in config/app.bcl. Call it from init.
+func RegisterBackend(name string, open Backend) { backends[name] = open }

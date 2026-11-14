@@ -1,0 +1,299 @@
+package workflow
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/oarkflow/ref/pipeline"
+
+)
+
+// ---- appointments ----------------------------------------------------------------
+
+// AppointmentStage is the stage a face-to-face meeting is booked on.
+const AppointmentStage = "verification"
+
+// Appointment is a booked in-person meeting. It carries nothing about the case.
+type Appointment struct {
+	ID       string    `json:"id"`
+	When     time.Time `json:"when"`
+	Location string    `json:"location"` // a branch code
+	Label    string    `json:"label"`    // its name
+	Past     bool      `json:"past"`
+}
+
+// Appointments lists a case's meetings, soonest first.
+func (s *Service) Appointments(c *pipeline.Case) []Appointment {
+	out := []Appointment{}
+	e, ok := s.eng(c.Pipeline)
+	ss := c.Stages[AppointmentStage]
+	if !ok || ss == nil {
+		return out
+	}
+	for _, sc := range ss.Schedules {
+		a := Appointment{ID: sc.ID, When: sc.Date, Location: sc.Label, Label: sc.Label, Past: sc.Date.Before(s.Time())}
+		if e.Lookup != nil {
+			for _, o := range e.Lookup("branch", c) {
+				if o.Value == sc.Label {
+					a.Label = o.Label
+				}
+			}
+		}
+		out = append(out, a)
+	}
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].When.Before(out[j-1].When); j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
+}
+
+// bookable checks a meeting time against the office calendar and the branches.
+func (s *Service) bookable(e *pipeline.Engine, c *pipeline.Case, when time.Time, branch string) error {
+	if !when.After(s.Time().Add(time.Hour)) {
+		return Err(422, "INVALID_APPOINTMENT", "book a meeting at least an hour from now")
+	}
+	if when.After(s.Time().AddDate(0, 0, 60)) {
+		return Err(422, "INVALID_APPOINTMENT", "book a meeting within the next 60 days")
+	}
+	if e.Lookup != nil {
+		found := false
+		for _, o := range e.Lookup("branch", c) {
+			found = found || o.Value == branch
+		}
+		if !found {
+			return Err(422, "INVALID_APPOINTMENT", "choose one of our offices")
+		}
+	}
+	for _, cal := range e.C.Def.Calendars {
+		if cal.Name != "office" {
+			continue
+		}
+		wc, err := pipeline.CompileCalendar(cal)
+		if err != nil {
+			return err
+		}
+		if !wc.IsOpen(when) {
+			return Err(422, "OFFICE_CLOSED", "the office is closed then; choose a time within working hours (%s)", cal.Hours)
+		}
+	}
+	return nil
+}
+
+// Book books an in-person meeting for a case at a branch. The meeting must fall
+// inside the office's working hours, and a case has one upcoming meeting at a
+// time. The person is told by the workflow's appointment.booked notification.
+func (s *Service) Book(ctx context.Context, id string, actor pipeline.Actor, when time.Time, branch string) (*pipeline.Case, error) {
+	c, err := s.Mutate(ctx, id, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+		if err := s.bookable(e, c, when, branch); err != nil {
+			return nil, err
+		}
+		for _, a := range s.Appointments(c) {
+			if !a.Past {
+				return nil, Err(409, "APPOINTMENT_EXISTS", "this case already has an upcoming meeting; cancel it first")
+			}
+		}
+		out, _, err := e.AddSchedule(ctx, c, actor, AppointmentStage, when.UTC().Format(time.RFC3339), branch)
+		return out, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.announce(ctx, c, "appointment.booked", actor.ID, map[string]any{"when": when.UTC(), "branch": branch})
+	return c, nil
+}
+
+// CancelAppointment removes a meeting and tells the person.
+func (s *Service) CancelAppointment(ctx context.Context, id string, actor pipeline.Actor, appointmentID, reason string) (*pipeline.Case, error) {
+	c, err := s.Mutate(ctx, id, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+		st, ok := e.C.Stage(AppointmentStage)
+		if !ok || !e.CanAct(c, st, actor) {
+			return nil, fmt.Errorf("%w: you may not change meetings on this case", pipeline.ErrForbidden)
+		}
+		ss := c.Stages[AppointmentStage]
+		if ss == nil {
+			return nil, ErrNotFound
+		}
+		out := c.Clone()
+		os := out.Stages[AppointmentStage]
+		kept := os.Schedules[:0]
+		found := false
+		for _, sc := range os.Schedules {
+			if sc.ID == appointmentID {
+				found = true
+				continue
+			}
+			kept = append(kept, sc)
+		}
+		if !found {
+			return nil, ErrNotFound
+		}
+		os.Schedules = kept
+		now := s.Time()
+		out.History = append(out.History, pipeline.Entry{At: now, Actor: actor.ID, Stage: AppointmentStage, Action: "schedule.cancelled", Comment: strings.TrimSpace(reason)})
+		out.UpdatedAt = now
+		return out, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.announce(ctx, c, "appointment.cancelled", actor.ID, nil)
+	return c, nil
+}
+
+// announce raises a workflow event the engine does not raise itself, so BCL
+// `notify` and `on` rules treat it like any other.
+func (s *Service) announce(ctx context.Context, c *pipeline.Case, name, actor string, detail map[string]any) {
+	e, ok := s.eng(c.Pipeline)
+	if !ok {
+		return
+	}
+	s.dispatchEvents(ctx, e, c, []pipeline.Event{{Name: name, Stage: AppointmentStage, Actor: actor, At: s.Time(), Detail: detail}})
+}
+
+// ---- external parties --------------------------------------------------------------
+
+// ExternalForms are the forms a person outside the application may be asked to fill, by
+// workflow. Everything else in a case belongs to the applicant or the staff.
+var ExternalForms = map[string][]string{"kyb": {"referee"}}
+
+// IssueLink creates a signed, single-use, expiring link that lets a person outside
+// the application (a referee) fill in part of one case's form, with no account. It returns
+// the token. What they may fill is fixed by the BCL stage's external_roles and the
+// scope (form names) given here.
+func (s *Service) IssueLink(ctx context.Context, id string, actor pipeline.Actor, party string, scope []string, ttl time.Duration) (string, error) {
+	var token string
+	c0, err := s.Get(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	// Only forms meant for an outsider may be put in their hands: never the person's
+	// or business's own details.
+	allowed := ExternalForms[c0.Pipeline]
+	for _, sc := range scope {
+		form, _, _ := strings.Cut(sc, ".")
+		ok := false
+		for _, a := range allowed {
+			ok = ok || a == form
+		}
+		if !ok {
+			return "", &pipeline.ValidationError{Message: "an outside party may fill only a reference form", Fields: []pipeline.FieldError{{Path: "scope", Rule: "option", Message: fmt.Sprintf("%q cannot be filled by an outside party", sc)}}}
+		}
+	}
+	_, err = s.Mutate(ctx, id, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+		out, tok, err := e.IssueLink(ctx, c, actor, c.Stage, party, scope, ttl)
+		token = tok
+		return out, err
+	})
+	return token, err
+}
+
+// External is a link opened: the case it belongs to, its engine and the outside actor.
+type External struct {
+	Case   *pipeline.Case
+	Engine *pipeline.Engine
+	Actor  pipeline.Actor
+}
+
+// OpenLink resolves a link token. Every way it can be wrong (forged, expired,
+// used, for a case that is gone) gives the same error.
+func (s *Service) OpenLink(ctx context.Context, token string) (External, error) {
+	bad := fmt.Errorf("%w: the link is not valid", pipeline.ErrForbidden)
+	var any *pipeline.Engine
+	for _, e := range s.allEngines() {
+		any = e
+		break
+	}
+	if any == nil {
+		return External{}, bad
+	}
+	caseID, _, err := any.ParseLinkToken(token)
+	if err != nil {
+		return External{}, bad
+	}
+	c, err := s.Get(ctx, caseID)
+	if err != nil {
+		return External{}, bad
+	}
+	e, _ := s.eng(c.Pipeline)
+	if e == nil {
+		return External{}, bad
+	}
+	actor, err := e.LinkActor(c, token)
+	if err != nil {
+		return External{}, bad
+	}
+	return External{Case: c, Engine: e, Actor: actor}, nil
+}
+
+// SubmitLink saves what an outside party filled in and uses up the link.
+func (s *Service) SubmitLink(ctx context.Context, token string, data map[string]any) error {
+	x, err := s.OpenLink(ctx, token)
+	if err != nil {
+		return err
+	}
+	_, err = s.Mutate(ctx, x.Case.ID, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+		return e.LinkSubmit(ctx, c, x.Actor, data)
+	})
+	return err
+}
+
+// ---- analytics ---------------------------------------------------------------------
+
+// Analytics reports where time goes in a workflow for a tenant: time in each
+// stage, queues, how often work loops back, deadlines met, and the stages that
+// hold work up. It reads up to `limit` of the newest cases.
+func (s *Service) Analytics(ctx context.Context, name, tenant string, limit int) (pipeline.Analytics, error) {
+	e, ok := s.eng(name)
+	if !ok {
+		return pipeline.Analytics{}, fmt.Errorf("workflow: unknown pipeline %q", name)
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 2000
+	}
+	var ids []string
+	if err := s.DB.SelectContext(ctx, &ids, `SELECT id FROM workflow_cases WHERE tenant_id=? AND pipeline=? ORDER BY created_at DESC LIMIT ?`, tenant, name, limit); err != nil {
+		return pipeline.Analytics{}, err
+	}
+	z := e.NewAnalyzer(s.Time())
+	for _, id := range ids {
+		c, err := s.Get(ctx, id)
+		if err != nil {
+			continue
+		}
+		z.Add(c)
+	}
+	return z.Report(), nil
+}
+
+// Preview renders the form a new applicant would be shown with a tenant's proposed
+// settings applied, without saving anything: no case is stored and the settings
+// are not changed. It lets an administrator see a change before making it.
+func (s *Service) Preview(ctx context.Context, tenant, name string, ov *pipeline.Overrides) (*pipeline.View, []string, error) {
+	problems, err := s.CheckOverrides(name, ov)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(problems) > 0 {
+		return nil, problems, nil
+	}
+	s.engMu.RLock()
+	set := s.set
+	s.engMu.RUnlock()
+	compiled, ok := set.Pipelines[name]
+	if !ok {
+		return nil, nil, Err(404, "PIPELINE_NOT_FOUND", "no such workflow")
+	}
+	e := s.buildEngine(name, compiled, set.Lookups)
+	e.Overrides = func(*pipeline.Case) *pipeline.Overrides { return ov }
+	applicant := pipeline.Actor{ID: "preview", Roles: []string{"user"}}
+	c, err := e.Start(ctx, applicant, pipeline.StartOptions{ID: "preview", Number: "PREVIEW", TenantID: tenant, OrgUnit: tenant})
+	if err != nil {
+		return nil, nil, err
+	}
+	v, err := e.View(c, applicant, "")
+	return v, nil, err
+}

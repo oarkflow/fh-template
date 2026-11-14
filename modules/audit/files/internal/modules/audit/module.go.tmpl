@@ -1,0 +1,53 @@
+package audit
+
+import (
+	"context"
+	"embed"
+	"io/fs"
+	"strconv"
+
+	"__FH_MODULE__/internal/modules"
+	"github.com/oarkflow/fh"
+)
+
+//go:embed sql/*.sql
+var migrations embed.FS
+
+// ServiceName is the key other modules use with modules.Service[*Log].
+const ServiceName = "audit"
+
+type module struct{}
+
+// Module returns the audit module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string { return ServiceName }
+
+func (module) Migrations() fs.FS {
+	sub, _ := fs.Sub(migrations, "sql")
+	return sub
+}
+
+func (module) Register(_ context.Context, d *modules.Deps) error {
+	log := New(d.DB)
+	d.DeclarePermissions("audit:read")
+	d.Provide(ServiceName, log)
+	admin := d.Require("audit:read")
+	d.API.Get("/audit", admin, func(c fh.Ctx) error {
+		limit, _ := strconv.Atoi(c.Query("limit"))
+		entries, err := log.List(c.Context(), limit)
+		if err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "AUDIT_LIST_FAILED", "could not read the audit log")
+		}
+		return c.JSON(fh.Map{"entries": entries})
+	}).Name("audit-list").Tag("audit")
+	d.API.Get("/audit/verify", admin, func(c fh.Ctx) error {
+		bad, err := log.Verify(c.Context())
+		if err != nil {
+			return fh.NewHTTPError(fh.StatusInternalServerError, "AUDIT_VERIFY_FAILED", "could not verify the audit log")
+		}
+		seq, hash, _ := log.Head(c.Context())
+		return c.JSON(fh.Map{"intact": bad == 0, "firstBrokenSeq": bad, "headSeq": seq, "headHash": hash})
+	}).Name("audit-verify").Tag("audit")
+	return nil
+}

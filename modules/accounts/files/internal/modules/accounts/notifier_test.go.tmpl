@@ -1,0 +1,38 @@
+package accounts
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestDevNotifierLastOTP(t *testing.T) {
+	d := NewDevNotifier()
+	_ = d.Send(context.Background(), "email", "a@x.io", "otp", "Your verification code is 123456. It expires in 10 minutes.")
+	_ = d.Send(context.Background(), "email", "a@x.io", "otp", "Your verification code is 654321. It expires in 10 minutes.")
+	if got := d.LastOTP("a@x.io"); got != "654321" {
+		t.Fatalf("got %q, want the newest code", got)
+	}
+	if d.LastOTP("nobody@x.io") != "" {
+		t.Fatal("code for an unknown recipient")
+	}
+}
+
+func TestHTTPNotifierPostsAndReportsFailure(t *testing.T) {
+	var auth string
+	status := http.StatusOK
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	n := HTTPNotifier{URL: srv.URL, Token: "tok"}
+	if err := n.Send(context.Background(), "sms", "+977", "otp", "m"); err != nil || auth != "Bearer tok" {
+		t.Fatalf("err=%v auth=%q", err, auth)
+	}
+	status = http.StatusBadGateway
+	if err := n.Send(context.Background(), "sms", "+977", "otp", "m"); err == nil {
+		t.Fatal("gateway failure was swallowed; an OTP would be silently lost")
+	}
+}

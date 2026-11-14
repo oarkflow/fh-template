@@ -1,0 +1,111 @@
+package accounts
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	appauth "__FH_MODULE__/internal/auth"
+	"github.com/oarkflow/fh"
+)
+
+// Verifier implements appauth.Verifier over the configured datasources.
+type Verifier struct {
+	svc     *Service
+	sources []Source
+}
+
+// NewVerifier orders the sources as auth.sources lists them.
+func NewVerifier(svc *Service, sources []Source) *Verifier {
+	return &Verifier{svc: svc, sources: sources}
+}
+
+var errInvalid = func() error { return Err(401, "INVALID_CREDENTIALS", "invalid credentials") }
+
+// Verify authenticates a login. Every failure returns the same error so it
+// cannot be used to enumerate accounts; lockout is tracked per tenant and
+// identifier no matter which datasource holds the account.
+func (v *Verifier) Verify(c fh.Ctx, in appauth.LoginInput) (appauth.Identity, error) {
+	return v.VerifyContext(c.Context(), in)
+}
+
+func (v *Verifier) VerifyContext(ctx context.Context, in appauth.LoginInput) (appauth.Identity, error) {
+	s := v.svc
+	cfg := s.Settings
+	tenant := cfg.Tenant(in.Tenant)
+	ident := strings.ToLower(strings.TrimSpace(in.Username))
+	subject := s.Vault.BlindIndex("login", tenant+"|"+ident)
+
+	if v.locked(ctx, tenant, subject) {
+		return appauth.Identity{}, Err(429, "ACCOUNT_LOCKED", "too many failed attempts; try again later")
+	}
+
+	var rec *Record
+	for _, src := range v.sources {
+		r, err := src.Lookup(ctx, tenant, ident)
+		if err != nil {
+			return appauth.Identity{}, Err(503, "AUTH_UNAVAILABLE", "sign-in is temporarily unavailable")
+		}
+		if r != nil {
+			rec = r
+			break
+		}
+	}
+	if rec == nil {
+		_, _ = VerifyPassword(in.Password, s.dummy) // equalise timing
+		return appauth.Identity{}, v.fail(ctx, tenant, subject, "")
+	}
+
+	ok := rec.PasswordOK(in.Password)
+	if ok {
+		mode := cfg.Auth.MFA.TOTP
+		switch {
+		case rec.TOTPEnabled && mode != "off":
+			ok = VerifyTOTP(rec.TOTPSecret, in.OTP, s.now())
+			if !ok && in.OTP == "" {
+				return appauth.Identity{}, Err(401, "OTP_REQUIRED", "an authenticator code is required")
+			}
+		case mode == "required":
+			ok = false // required, but this account has no authenticator
+		}
+	}
+	if !ok || !rec.Active {
+		return appauth.Identity{}, v.fail(ctx, tenant, subject, rec.ID)
+	}
+	v.clear(ctx, tenant, subject)
+	s.log(ctx, rec.ID, "account.login", rec.ID, map[string]any{"source": rec.Source})
+	return appauth.Identity{ID: rec.ID, Name: rec.Name, Tenant: rec.Tenant, Roles: rec.Roles}, nil
+}
+
+func (v *Verifier) locked(ctx context.Context, tenant, subject string) bool {
+	var until string
+	if err := v.svc.DB.GetContext(ctx, &until, `SELECT locked_until FROM auth_lockouts WHERE tenant_id=? AND subject_bidx=?`, tenant, subject); err != nil || until == "" {
+		return false
+	}
+	t, _ := time.Parse(time.RFC3339, until)
+	return v.svc.now().Before(t)
+}
+
+func (v *Verifier) fail(ctx context.Context, tenant, subject, account string) error {
+	s := v.svc
+	lock := s.Settings.Auth.Lockout
+	var failed int
+	_ = s.DB.GetContext(ctx, &failed, `SELECT failed FROM auth_lockouts WHERE tenant_id=? AND subject_bidx=?`, tenant, subject)
+	failed++
+	until := ""
+	if failed >= lock.MaxFailures {
+		until = s.now().Add(time.Duration(lock.LockMinutes) * time.Minute).UTC().Format(time.RFC3339)
+		failed = 0
+		s.log(ctx, account, "account.locked", account, nil)
+	}
+	_, _ = s.DB.ExecContext(ctx, `INSERT INTO auth_lockouts (tenant_id, subject_bidx, failed, locked_until) VALUES (?,?,?,?)
+		ON CONFLICT(tenant_id, subject_bidx) DO UPDATE SET failed=excluded.failed, locked_until=excluded.locked_until`, tenant, subject, failed, until)
+	if until != "" {
+		return Err(429, "ACCOUNT_LOCKED", "too many failed attempts; try again later")
+	}
+	return errInvalid()
+}
+
+func (v *Verifier) clear(ctx context.Context, tenant, subject string) {
+	_, _ = v.svc.DB.ExecContext(ctx, `DELETE FROM auth_lockouts WHERE tenant_id=? AND subject_bidx=?`, tenant, subject)
+}

@@ -1,0 +1,354 @@
+// Package settings loads the application's BCL configuration: tenancy mode,
+// roles and permissions, identity datasources, authentication policy and the
+// key-management backend. Everything has a safe default, so a project with no
+// config file still starts (single tenant, admin/editor/viewer roles).
+package settings
+
+import (
+	"fmt"
+	"os"
+	"regexp"
+	"slices"
+	"strings"
+
+	"github.com/oarkflow/bcl"
+)
+
+var permissionRe = regexp.MustCompile(`^[a-z][a-z_]{0,31}:[a-z][a-z_]{0,31}$`)
+
+type Settings struct {
+	Tenancy      Tenancy      `bcl:"tenancy"`
+	Roles        []Role       `bcl:"role,block"`
+	Registration Registration `bcl:"registration"`
+	Sources      []Source     `bcl:"datasource,block"`
+	Auth         Auth         `bcl:"auth"`
+	Vault        Vault        `bcl:"vault"`
+}
+
+type Tenancy struct {
+	Mode    string `bcl:"mode"` // single | multi
+	Default string `bcl:"default"`
+}
+
+type Role struct {
+	ID          string   `bcl:",id" json:"id"`
+	Title       string   `bcl:"title" json:"title"`
+	Description string   `bcl:"description" json:"description"`
+	Permissions []string `bcl:"permissions" json:"permissions"`
+	Inherits    []string `bcl:"inherits" json:"inherits"`
+	// Staff roles can be assigned only by an administrator; self-registration
+	// never produces one.
+	Staff bool `bcl:"staff" json:"staff"`
+}
+
+type Registration struct {
+	Enabled     bool   `bcl:"enabled"`
+	DefaultRole string `bcl:"default_role"`
+	Verify      string `bcl:"verify"` // email | phone | none
+}
+
+// Source is one identity datasource.
+type Source struct {
+	ID   string `bcl:",id"`
+	Kind string `bcl:"kind"` // builtin | static | sql
+
+	Users []StaticUser `bcl:"user,block"` // static
+
+	Driver string  `bcl:"driver"`  // sql
+	DSNEnv string  `bcl:"dsn_env"` // sql; empty means the application database
+	Hash   string  `bcl:"hash"`    // sql: argon2id | bcrypt
+	Lookup string  `bcl:"lookup"`  // sql: query with one ? for the identifier
+	Cols   Columns `bcl:"columns"`
+}
+
+type StaticUser struct {
+	ID              string   `bcl:",id"`
+	Name            string   `bcl:"name"`
+	PasswordEnv     string   `bcl:"password_env"`      // plain secret from the environment (development)
+	PasswordHashEnv string   `bcl:"password_hash_env"` // argon2id/bcrypt hash from the environment
+	Roles           []string `bcl:"roles"`
+	Tenant          string   `bcl:"tenant"`
+}
+
+// Columns maps the result of a sql datasource's lookup to identity fields.
+type Columns struct {
+	ID         string `bcl:"id"`
+	Identifier string `bcl:"identifier"`
+	Password   string `bcl:"password"`
+	Roles      string `bcl:"roles"`
+	Status     string `bcl:"status"`
+	TOTP       string `bcl:"totp"`
+	Tenant     string `bcl:"tenant"`
+	Name       string `bcl:"name"`
+}
+
+type Auth struct {
+	Sources           []string `bcl:"sources"`
+	Identifier        string   `bcl:"identifier"`
+	MinPasswordLength int      `bcl:"min_password_length"`
+	OTPTTLSeconds     int      `bcl:"otp_ttl_seconds"`
+	SessionMinutes    int      `bcl:"session_minutes"`
+	Lockout           Lockout  `bcl:"lockout"`
+	MFA               MFA      `bcl:"mfa"`
+}
+
+type Lockout struct {
+	MaxFailures int `bcl:"max_failures"`
+	LockMinutes int `bcl:"lock_minutes"`
+}
+
+type MFA struct {
+	TOTP   string `bcl:"totp"` // off | optional | required
+	Issuer string `bcl:"issuer"`
+}
+
+type Vault struct {
+	Backend string `bcl:"backend"` // env | secretr
+	Dir     string `bcl:"dir"`
+}
+
+// DefaultRoles are used when the file defines none.
+func DefaultRoles() []Role {
+	return []Role{
+		{ID: "admin", Title: "Administrator", Description: "Full access.", Permissions: []string{"*"}, Staff: true},
+		{ID: "editor", Title: "Editor", Description: "Can create and change content.", Permissions: []string{"notes:read", "notes:write"}, Staff: true},
+		{ID: "viewer", Title: "Viewer", Description: "Read-only access.", Permissions: []string{"notes:read"}},
+	}
+}
+
+// Defaults returns settings for a project with no config file.
+func Defaults() Settings {
+	s := Settings{Sources: []Source{{ID: "bootstrap", Kind: "static", Users: []StaticUser{{ID: "admin", Name: "Administrator", PasswordEnv: "APP_LOGIN_PASSWORD", Roles: []string{"admin"}}}}}}
+	s.applyDefaults()
+	return s
+}
+
+// Load reads path (APP_CONFIG when empty, else config/app.bcl). A missing file
+// yields Defaults; an invalid one is an error.
+func Load(path string) (Settings, error) {
+	if path == "" {
+		path = os.Getenv("APP_CONFIG")
+	}
+	if path == "" {
+		path = "config/app.bcl"
+	}
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return Defaults(), nil
+	}
+	if err != nil {
+		return Settings{}, err
+	}
+	return Parse(raw)
+}
+
+// Parse decodes and validates BCL source.
+func Parse(src []byte) (Settings, error) {
+	var s Settings
+	if err := bcl.Unmarshal(src, &s); err != nil {
+		return Settings{}, fmt.Errorf("settings: %w", err)
+	}
+	s.applyDefaults()
+	if err := s.Validate(); err != nil {
+		return Settings{}, err
+	}
+	return s, nil
+}
+
+func (s *Settings) applyDefaults() {
+	if s.Tenancy.Mode == "" {
+		s.Tenancy.Mode = "single"
+	}
+	if s.Tenancy.Default == "" {
+		s.Tenancy.Default = "default"
+	}
+	if len(s.Roles) == 0 {
+		s.Roles = DefaultRoles()
+	}
+	if s.Registration.DefaultRole == "" {
+		s.Registration.DefaultRole = "viewer"
+	}
+	if s.Registration.Verify == "" {
+		s.Registration.Verify = "email"
+	}
+	a := &s.Auth
+	if a.Identifier == "" {
+		a.Identifier = "email"
+	}
+	if a.MinPasswordLength == 0 {
+		a.MinPasswordLength = 12
+	}
+	if a.OTPTTLSeconds == 0 {
+		a.OTPTTLSeconds = 600
+	}
+	if a.SessionMinutes == 0 {
+		a.SessionMinutes = 30
+	}
+	if a.Lockout.MaxFailures == 0 {
+		a.Lockout.MaxFailures = 5
+	}
+	if a.Lockout.LockMinutes == 0 {
+		a.Lockout.LockMinutes = 15
+	}
+	if a.MFA.TOTP == "" {
+		a.MFA.TOTP = "optional"
+	}
+	if a.MFA.Issuer == "" {
+		a.MFA.Issuer = "App"
+	}
+	if len(a.Sources) == 0 && len(s.Sources) > 0 {
+		a.Sources = []string{s.Sources[0].ID}
+	}
+	if s.Vault.Backend == "" {
+		s.Vault.Backend = "env"
+	}
+	if s.Vault.Dir == "" {
+		s.Vault.Dir = "data/kms"
+	}
+	for i := range s.Sources {
+		if s.Sources[i].Kind == "sql" && s.Sources[i].Hash == "" {
+			s.Sources[i].Hash = "argon2id"
+		}
+	}
+}
+
+// Validate reports the first inconsistency.
+func (s Settings) Validate() error {
+	if !slices.Contains([]string{"single", "multi"}, s.Tenancy.Mode) {
+		return fmt.Errorf("settings: tenancy.mode must be single or multi, got %q", s.Tenancy.Mode)
+	}
+	roles := map[string]bool{}
+	admin := false
+	for _, r := range s.Roles {
+		if r.ID == "" || roles[r.ID] {
+			return fmt.Errorf("settings: role %q is empty or defined twice", r.ID)
+		}
+		roles[r.ID] = true
+		admin = admin || slices.Contains(r.Permissions, "*")
+	}
+	for _, r := range s.Roles {
+		for _, p := range r.Permissions {
+			if p != "*" && !permissionRe.MatchString(p) {
+				return fmt.Errorf("settings: role %q permission %q must be \"*\" or resource:action in lower-case words", r.ID, p)
+			}
+		}
+	}
+	if !admin {
+		return fmt.Errorf("settings: at least one role must hold the \"*\" permission, or nobody can administer access")
+	}
+	for _, r := range s.Roles {
+		for _, parent := range r.Inherits {
+			if !roles[parent] {
+				return fmt.Errorf("settings: role %q inherits unknown role %q", r.ID, parent)
+			}
+		}
+	}
+	if s.Registration.Enabled {
+		if !roles[s.Registration.DefaultRole] {
+			return fmt.Errorf("settings: registration.default_role %q is not a defined role", s.Registration.DefaultRole)
+		}
+		for _, r := range s.Roles {
+			if r.ID == s.Registration.DefaultRole && r.Staff {
+				return fmt.Errorf("settings: registration.default_role %q is a staff role", r.ID)
+			}
+		}
+	}
+	ids := map[string]Source{}
+	for _, d := range s.Sources {
+		if _, dup := ids[d.ID]; dup || d.ID == "" {
+			return fmt.Errorf("settings: datasource %q is empty or defined twice", d.ID)
+		}
+		ids[d.ID] = d
+		switch d.Kind {
+		case "builtin", "static":
+		case "sql":
+			if d.Lookup == "" || d.Cols.ID == "" || d.Cols.Password == "" {
+				return fmt.Errorf("settings: sql datasource %q needs lookup, columns.id and columns.password", d.ID)
+			}
+			if !slices.Contains([]string{"argon2id", "bcrypt"}, d.Hash) {
+				return fmt.Errorf("settings: datasource %q hash must be argon2id or bcrypt", d.ID)
+			}
+		default:
+			return fmt.Errorf("settings: datasource %q has unknown kind %q", d.ID, d.Kind)
+		}
+	}
+	for _, id := range s.Auth.Sources {
+		if _, ok := ids[id]; !ok {
+			return fmt.Errorf("settings: auth.sources names unknown datasource %q", id)
+		}
+	}
+	if !slices.Contains([]string{"off", "optional", "required"}, s.Auth.MFA.TOTP) {
+		return fmt.Errorf("settings: auth.mfa.totp must be off, optional or required")
+	}
+	if !slices.Contains([]string{"env", "secretr"}, s.Vault.Backend) {
+		return fmt.Errorf("settings: vault.backend must be env or secretr")
+	}
+	return nil
+}
+
+// MultiTenant reports whether tenants are isolated from one another.
+func (s Settings) MultiTenant() bool { return s.Tenancy.Mode == "multi" }
+
+// Tenant resolves the tenant a request belongs to: the requested one in multi
+// mode (falling back to the default), always the default in single mode.
+func (s Settings) Tenant(requested string) string {
+	requested = strings.TrimSpace(requested)
+	if s.MultiTenant() && requested != "" {
+		return requested
+	}
+	return s.Tenancy.Default
+}
+
+// Role returns a role definition by id.
+func (s Settings) Role(id string) (Role, bool) {
+	for _, r := range s.Roles {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return Role{}, false
+}
+
+// Allows reports whether any of the roles grants permission, following
+// inheritance. It evaluates the BCL defaults; the rbac module replaces this
+// with the editable, database-backed version.
+func (s Settings) Allows(roles []string, permission string) bool {
+	seen := map[string]bool{}
+	var walk func(id string) bool
+	walk = func(id string) bool {
+		if seen[id] {
+			return false
+		}
+		seen[id] = true
+		r, ok := s.Role(id)
+		if !ok {
+			return false
+		}
+		if Grants(r.Permissions, permission) {
+			return true
+		}
+		for _, parent := range r.Inherits {
+			if walk(parent) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, id := range roles {
+		if walk(id) {
+			return true
+		}
+	}
+	return false
+}
+
+// Grants reports whether a permission list covers permission: "*" grants
+// everything, anything else must match exactly. There are no partial wildcards.
+func Grants(list []string, permission string) bool {
+	for _, p := range list {
+		if p == "*" || p == permission {
+			return true
+		}
+	}
+	return false
+}

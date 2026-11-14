@@ -1,0 +1,53 @@
+package accounts
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base32"
+	"encoding/binary"
+	"fmt"
+	"net/url"
+	"time"
+)
+
+// NewTOTPSecret returns a random base32 secret (160 bits).
+func NewTOTPSecret() string {
+	b := make([]byte, 20)
+	_, _ = rand.Read(b)
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)
+}
+
+// TOTPCode computes the RFC 6238 six-digit code for a time step.
+func TOTPCode(secret string, t time.Time) (string, error) {
+	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secret)
+	if err != nil {
+		return "", err
+	}
+	var ctr [8]byte
+	binary.BigEndian.PutUint64(ctr[:], uint64(t.Unix()/30))
+	m := hmac.New(sha1.New, key)
+	m.Write(ctr[:])
+	sum := m.Sum(nil)
+	off := sum[len(sum)-1] & 0x0f
+	v := binary.BigEndian.Uint32(sum[off:off+4]) & 0x7fffffff
+	return fmt.Sprintf("%06d", v%1000000), nil
+}
+
+// VerifyTOTP accepts the current step and one step either side (clock skew).
+func VerifyTOTP(secret, code string, now time.Time) bool {
+	ok := false
+	for _, d := range []time.Duration{-30 * time.Second, 0, 30 * time.Second} {
+		want, err := TOTPCode(secret, now.Add(d))
+		if err == nil && hmac.Equal([]byte(want), []byte(code)) {
+			ok = true // keep looping: constant work regardless of which step matched
+		}
+	}
+	return ok
+}
+
+// TOTPURI is the otpauth:// provisioning URI for authenticator apps.
+func TOTPURI(issuer, account, secret string) string {
+	v := url.Values{"secret": {secret}, "issuer": {issuer}}
+	return "otpauth://totp/" + url.PathEscape(issuer+":"+account) + "?" + v.Encode()
+}

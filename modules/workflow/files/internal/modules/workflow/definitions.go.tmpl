@@ -1,0 +1,253 @@
+package workflow
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
+	"slices"
+	"strings"
+
+	"github.com/oarkflow/bcl"
+	"github.com/oarkflow/ref/pipeline"
+
+)
+
+// Publishing a definition: the BCL text of a workflow can be changed while the
+// system runs. A change is checked (it must compile, name the workflow it
+// replaces, and keep every stage a case in flight is waiting at), signed, stored
+// as a new version and put into use at once. Earlier versions are kept and can
+// be restored. The signature is checked every time definitions are loaded, so a
+// changed row in the database is refused rather than trusted.
+
+// DefinitionRevision is one stored version of a workflow's definition.
+type DefinitionRevision struct {
+	Version  int    `db:"version" json:"version"`
+	Author   string `db:"author" json:"author"`
+	Note     string `db:"note" json:"note"`
+	At       string `db:"at" json:"at"`
+	Active   bool   `db:"-" json:"active"`
+	Verified bool   `db:"-" json:"verified"`
+	ActiveN  int    `db:"active" json:"-"`
+	Source   string `db:"source" json:"-"`
+	Sig      string `db:"signature" json:"-"`
+	Name     string `db:"name" json:"-"`
+}
+
+func (s *Service) definitionKey() []byte {
+	mac := hmac.New(sha256.New, s.signingKey)
+	mac.Write([]byte("fh/workflow/definitions/v1"))
+	return mac.Sum(nil)
+}
+
+// sign binds a source to its name and version.
+func (s *Service) sign(name string, version int, source string) string {
+	h := sha256.Sum256([]byte(source))
+	mac := hmac.New(sha256.New, s.definitionKey())
+	fmt.Fprintf(mac, "%s\x00%d\x00%s", name, version, hex.EncodeToString(h[:]))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Service) verified(r DefinitionRevision) bool {
+	return hmac.Equal([]byte(r.Sig), []byte(s.sign(r.Name, r.Version, r.Source)))
+}
+
+// parse compiles a definition's source, which must hold exactly the named workflow
+// (and may add lookups).
+func parse(name, source string) (*document, *pipeline.Compiled, []string) {
+	var doc document
+	if err := bcl.UnmarshalWithOptions([]byte(source), &doc, &bcl.Options{}); err != nil {
+		return nil, nil, []string{"the definition does not parse: " + err.Error()}
+	}
+	if len(doc.Pipelines) != 1 {
+		return nil, nil, []string{fmt.Sprintf("it must define exactly one workflow, %q (found %d)", name, len(doc.Pipelines))}
+	}
+	if doc.Pipelines[0].Name != name {
+		return nil, nil, []string{fmt.Sprintf("it defines %q, not %q; a workflow cannot be renamed by publishing", doc.Pipelines[0].Name, name)}
+	}
+	c, err := pipeline.Compile(&doc.Pipelines[0])
+	if err != nil {
+		return nil, nil, []string{"the definition does not compile: " + err.Error()}
+	}
+	return &doc, c, nil
+}
+
+// CheckDefinition says what is wrong with a proposed definition, without storing it.
+func (s *Service) CheckDefinition(ctx context.Context, name, source string) []string {
+	if _, ok := s.eng(name); !ok {
+		return []string{fmt.Sprintf("there is no workflow %q to replace", name)}
+	}
+	if len(source) > 512<<10 {
+		return []string{"the definition is larger than 512 KB"}
+	}
+	_, compiled, problems := parse(name, source)
+	if len(problems) > 0 {
+		return problems
+	}
+	// Every case still in progress must be waiting at a stage the new definition has.
+	var stages []string
+	if err := s.DB.SelectContext(ctx, &stages, `SELECT DISTINCT stage FROM workflow_cases WHERE pipeline=? AND status IN ('draft','in_progress','returned','suspended')`, name); err != nil {
+		return []string{err.Error()}
+	}
+	for _, st := range stages {
+		if _, ok := compiled.Stage(st); !ok {
+			problems = append(problems, fmt.Sprintf("cases are waiting at stage %q, which the new definition does not have", st))
+		}
+	}
+	return problems
+}
+
+// Publish stores and activates a new version of a workflow's definition.
+func (s *Service) Publish(ctx context.Context, author, name, source, note string) (int, []string, error) {
+	// The name is used as a map key that outlives the request, and the web layer may hand
+	// out strings that share the request's buffer: keep our own copies.
+	name, source = strings.Clone(name), strings.Clone(source)
+	if problems := s.CheckDefinition(ctx, name, source); len(problems) > 0 {
+		return 0, problems, Err(422, "INVALID_DEFINITION", "the definition cannot be published")
+	}
+	if len(strings.TrimSpace(note)) < 3 {
+		return 0, nil, Err(400, "NOTE_REQUIRED", "say what changed and why")
+	}
+	tx, err := s.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+	var version int
+	if err := tx.GetContext(ctx, &version, `SELECT COALESCE(MAX(version),0)+1 FROM workflow_definitions WHERE name=?`, name); err != nil {
+		return 0, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE workflow_definitions SET active=0 WHERE name=?`, name); err != nil {
+		return 0, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_definitions (name, version, source, signature, author, note, at, active) VALUES (?,?,?,?,?,?,?,1)`,
+		name, version, source, s.sign(name, version, source), author, strings.TrimSpace(note), s.Stamp()); err != nil {
+		return 0, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, nil, err
+	}
+	if err := s.applyPublished(ctx, name, source); err != nil {
+		return version, nil, err
+	}
+	_ = s.Audit.Append(ctx, author, "workflow.publish", name, map[string]any{"version": version})
+	return version, nil, nil
+}
+
+// applyPublished puts a definition's source into use: its workflow replaces the
+// running one, and its lookups replace the lookups of the same name.
+func (s *Service) applyPublished(ctx context.Context, name, source string) error {
+	doc, compiled, problems := parse(name, source)
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	s.engMu.RLock()
+	cur := s.set
+	s.engMu.RUnlock()
+	next := &Set{Pipelines: map[string]*pipeline.Compiled{}, Lookups: Lookups{}, Sources: map[string]string{}}
+	for k, v := range cur.Pipelines {
+		next.Pipelines[k] = v
+	}
+	for k, v := range cur.Lookups {
+		next.Lookups[k] = v
+	}
+	for k, v := range cur.Sources {
+		next.Sources[k] = v
+	}
+	for _, l := range doc.Lookups {
+		next.Lookups[l.Name] = l.Entries
+	}
+	next.Pipelines[name] = compiled
+	next.Sources[name] = source
+	s.install(next)
+	return nil
+}
+
+// Definitions lists a workflow's stored versions, newest first. Version 0 in the
+// result means the definition the system started with (from its file).
+func (s *Service) Definitions(ctx context.Context, name string) ([]DefinitionRevision, error) {
+	var rows []DefinitionRevision
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT name, version, source, signature, author, note, at, active FROM workflow_definitions WHERE name=? ORDER BY version DESC`, name); err != nil {
+		return nil, err
+	}
+	out := make([]DefinitionRevision, 0, len(rows))
+	for _, r := range rows {
+		r.Active, r.Verified = r.ActiveN == 1, s.verified(r)
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// Source returns the BCL text of a version (0 or the active one by default: what is running).
+func (s *Service) Source(ctx context.Context, name string, version int) (string, error) {
+	if version > 0 {
+		var r DefinitionRevision
+		if err := s.DB.GetContext(ctx, &r, `SELECT name, version, source, signature, author, note, at, active FROM workflow_definitions WHERE name=? AND version=?`, name, version); err != nil {
+			return "", Err(404, "VERSION_NOT_FOUND", "no such version")
+		}
+		return r.Source, nil
+	}
+	s.engMu.RLock()
+	defer s.engMu.RUnlock()
+	src, ok := s.set.Sources[name]
+	if !ok {
+		return "", Err(404, "PIPELINE_NOT_FOUND", "no such workflow")
+	}
+	return src, nil
+}
+
+// RestoreDefinition publishes an earlier version's source again as a new version.
+func (s *Service) RestoreDefinition(ctx context.Context, author, name string, version int) (int, []string, error) {
+	name = strings.Clone(name)
+	var r DefinitionRevision
+	if err := s.DB.GetContext(ctx, &r, `SELECT name, version, source, signature, author, note, at, active FROM workflow_definitions WHERE name=? AND version=?`, name, version); err != nil {
+		return 0, nil, Err(404, "VERSION_NOT_FOUND", "no such version")
+	}
+	if !s.verified(r) {
+		return 0, nil, Err(409, "SIGNATURE_INVALID", "that version's signature does not match its text; it will not be restored")
+	}
+	return s.Publish(ctx, author, name, r.Source, fmt.Sprintf("restore version %d", version))
+}
+
+// LoadPublished applies the active published definitions over the ones loaded from
+// files. A version whose signature does not match is refused and reported: the
+// file's definition keeps running.
+func (s *Service) LoadPublished(ctx context.Context) {
+	var rows []DefinitionRevision
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT name, version, source, signature, author, note, at, active FROM workflow_definitions WHERE active=1 ORDER BY name`); err != nil {
+		log.Printf("workflow: reading published definitions: %v", err)
+		return
+	}
+	for _, r := range rows {
+		if !s.verified(r) {
+			log.Printf("workflow: published definition %s v%d has a bad signature and is NOT used", r.Name, r.Version)
+			continue
+		}
+		if err := s.applyPublished(ctx, r.Name, r.Source); err != nil {
+			log.Printf("workflow: published definition %s v%d does not load and is NOT used: %v", r.Name, r.Version, err)
+		}
+	}
+}
+
+// Running reports which version of each workflow is in use (0 = the file's).
+func (s *Service) Running(ctx context.Context) map[string]int {
+	out := map[string]int{}
+	for _, n := range s.Names() {
+		out[n] = 0
+	}
+	var rows []struct {
+		Name    string `db:"name"`
+		Version int    `db:"version"`
+	}
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT name, version FROM workflow_definitions WHERE active=1`); err == nil {
+		for _, r := range rows {
+			if slices.Contains(s.Names(), r.Name) {
+				out[r.Name] = r.Version
+			}
+		}
+	}
+	return out
+}

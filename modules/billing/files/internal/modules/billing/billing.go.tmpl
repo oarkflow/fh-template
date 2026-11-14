@@ -1,0 +1,360 @@
+// Package billing charges customers per usage. Money is an integer count of the
+// currency's minor unit. A charge is an atomic conditional debit made before a
+// token is redeemed, so a customer that cannot pay never consumes a person's
+// one-time token, and every charge and refund is one idempotent ledger row.
+package billing
+
+import (
+	"__FH_MODULE__/internal/modules"
+	"context"
+	"database/sql"
+	"encoding/csv"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+	"time"
+
+)
+
+const (
+	KindUsage   = "usage"
+	KindRefund = "refund" // a denied usage's charge returned
+	KindTopUp  = "topup"
+	KindAdjust = "adjust"
+	// KindPayRefund returns money to the business (a payment refunded): a debit.
+	KindPayRefund = "payment_refund"
+)
+
+// Price is what one usage costs.
+type Price struct {
+	MeterID string
+	Currency  string
+	Minor     int64
+}
+
+type Service struct {
+	Deps
+	// Currencies, when set, is the list of currencies an account may be opened
+	// in. There is no exchange: every account holds one currency and a usage is
+	// charged in the currency of its meter.
+	Currencies []string
+	// OnLowBalance runs once when a balance first falls below its warning level.
+	OnLowBalance func(ctx context.Context, customerID, currency string, balance, level int64)
+	// Invoice details printed on statements.
+	TaxBps int
+	// DefaultLow is the warning level a newly opened account starts with.
+	DefaultLow  int64
+	SellerName  string
+	SellerTaxID string
+}
+
+func New(d Deps) *Service { return &Service{Deps: d} }
+
+// Entry is one ledger row. Negative amounts are debits.
+type Entry struct {
+	ID           string `db:"id" json:"id"`
+	CustomerID   string `db:"customer_id" json:"customerId"`
+	MeterID    string `db:"meter_id" json:"meterId,omitempty"`
+	Currency     string `db:"currency" json:"currency"`
+	Kind         string `db:"kind" json:"kind"`
+	AmountMinor  int64  `db:"amount_minor" json:"amountMinor"`
+	BalanceAfter int64  `db:"balance_after" json:"balanceAfter"`
+	Ref          string `db:"ref" json:"ref,omitempty"`
+	CreatedAt    string `db:"created_at" json:"createdAt"`
+}
+
+type Account struct {
+	CustomerID  string `db:"customer_id" json:"customerId"`
+	Currency    string `db:"currency" json:"currency"`
+	Balance     int64  `db:"balance_minor" json:"balanceMinor"`
+	CreditLimit int64  `db:"credit_limit_minor" json:"creditLimitMinor"`
+	// LowBalance is the warning level (0 = no warning); Low says the balance is under it.
+	LowBalance int64 `db:"low_balance_minor" json:"lowBalanceMinor"`
+	Low        bool  `db:"-" json:"low"`
+}
+
+var (
+	ErrInsufficient = Err(402, "INSUFFICIENT_BALANCE", "the customer balance cannot cover this usage; top up to continue")
+	ErrNoAccount    = Err(402, "BILLING_NOT_CONFIGURED", "no billing account exists for this currency")
+)
+
+func validCurrency(c string) bool {
+	if len(c) != 3 {
+		return false
+	}
+	for _, r := range c {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// OpenAccount creates the account if missing and sets its credit limit
+// (0 = prepaid: the balance may not go below zero).
+func (s *Service) OpenAccount(ctx context.Context, actor, customerID, currency string, creditLimit int64) error {
+	if !validCurrency(currency) || creditLimit < 0 {
+		return Err(400, "INVALID_ACCOUNT", "currency must be a 3-letter code and the credit limit non-negative")
+	}
+	if !s.currencyAllowed(currency) {
+		return Err(400, "CURRENCY_NOT_ALLOWED", "%s is not a currency this platform bills in (allowed: %s)", currency, strings.Join(s.Currencies, ", "))
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO billing_accounts (customer_id, currency, balance_minor, credit_limit_minor, low_balance_minor) VALUES (?,?,0,?,?)
+		ON CONFLICT(customer_id, currency) DO UPDATE SET credit_limit_minor=excluded.credit_limit_minor`, customerID, currency, creditLimit, s.DefaultLow); err != nil {
+		return err
+	}
+	_ = s.Audit.Append(ctx, actor, "billing.open_account", customerID, map[string]any{"currency": currency, "creditLimit": creditLimit})
+	return nil
+}
+
+func (s *Service) currencyAllowed(c string) bool {
+	if len(s.Currencies) == 0 {
+		return true
+	}
+	for _, a := range s.Currencies {
+		if a == c {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureAccount opens a prepaid account if there is none, and never changes an
+// existing one (OpenAccount would reset its credit limit).
+func (s *Service) EnsureAccount(ctx context.Context, actor, customerID, currency string) error {
+	if !validCurrency(currency) || !s.currencyAllowed(currency) {
+		return Err(400, "INVALID_ACCOUNT", "%s cannot be billed on this platform", currency)
+	}
+	res, err := s.DB.ExecContext(ctx, `INSERT INTO billing_accounts (customer_id, currency, balance_minor, credit_limit_minor, low_balance_minor) VALUES (?,?,0,0,?) ON CONFLICT DO NOTHING`, customerID, currency, s.DefaultLow)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		_ = s.Audit.Append(ctx, actor, "billing.open_account", customerID, map[string]any{"currency": currency, "creditLimit": 0})
+	}
+	return nil
+}
+
+// SetLowBalance sets the level under which a business is warned (0 turns it off).
+func (s *Service) SetLowBalance(ctx context.Context, actor, customerID, currency string, level int64) error {
+	if level < 0 {
+		return Err(400, "INVALID_LEVEL", "the warning level cannot be negative")
+	}
+	res, err := s.DB.ExecContext(ctx, `UPDATE billing_accounts SET low_balance_minor=?, low_notified=0 WHERE customer_id=? AND currency=?`, level, customerID, currency)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrNoAccount
+	}
+	_ = s.Audit.Append(ctx, actor, "billing.low_balance", customerID, map[string]any{"currency": currency, "level": level})
+	return nil
+}
+
+// Accounts lists a customer's accounts.
+func (s *Service) Accounts(ctx context.Context, customerID string) ([]Account, error) {
+	out := []Account{}
+	err := s.DB.SelectContext(ctx, &out, `SELECT customer_id, currency, balance_minor, credit_limit_minor, low_balance_minor FROM billing_accounts WHERE customer_id=? ORDER BY currency`, customerID)
+	for i := range out {
+		out[i].Low = out[i].LowBalance > 0 && out[i].Balance < out[i].LowBalance
+	}
+	return out, err
+}
+
+// TopUp adds funds. ref makes it idempotent (a payment gateway reference).
+func (s *Service) TopUp(ctx context.Context, actor, customerID, currency string, amount int64, ref string) (Entry, error) {
+	if amount <= 0 {
+		return Entry{}, Err(400, "INVALID_AMOUNT", "amount must be positive")
+	}
+	return s.post(ctx, customerID, "", currency, KindTopUp, amount, ref, actor)
+}
+
+// RefundPayment returns money to a business (a payment that is being refunded
+// outside the platform): a debit that may not take a prepaid balance below zero.
+// The reason is required and is kept in the audit trail.
+func (s *Service) RefundPayment(ctx context.Context, actor, customerID, currency string, amount int64, ref, reason string) (Entry, error) {
+	if amount <= 0 || strings.TrimSpace(ref) == "" || len(strings.TrimSpace(reason)) < 3 {
+		return Entry{}, Err(400, "INVALID_REFUND", "a refund needs a positive amount, a reference and a reason")
+	}
+	e, err := s.post(ctx, customerID, "", currency, KindPayRefund, -amount, ref, actor)
+	if err == nil {
+		_ = s.Audit.Append(ctx, actor, "billing.refund_reason", customerID, map[string]any{"ref": ref, "reason": reason})
+	}
+	return e, err
+}
+
+// Adjust applies a signed correction with a reason.
+func (s *Service) Adjust(ctx context.Context, actor, customerID, currency string, amount int64, ref, reason string) (Entry, error) {
+	if amount == 0 || strings.TrimSpace(ref) == "" || len(strings.TrimSpace(reason)) < 3 {
+		return Entry{}, Err(400, "INVALID_ADJUSTMENT", "an adjustment needs a non-zero amount, a reference and a reason")
+	}
+	e, err := s.post(ctx, customerID, "", currency, KindAdjust, amount, ref, actor)
+	if err == nil {
+		_ = s.Audit.Append(ctx, actor, "billing.adjust_reason", customerID, map[string]any{"ref": ref, "reason": reason})
+	}
+	return e, err
+}
+
+// MonthUsage counts the verified units a customer has been charged for in the
+// calendar month of t (charges less refunds of denied ones).
+func (s *Service) MonthUsage(ctx context.Context, customerID string, t time.Time) (int64, error) {
+	from, to := monthBounds(t)
+	var n int64
+	err := s.DB.GetContext(ctx, &n, `SELECT COALESCE(SUM(CASE kind WHEN 'usage' THEN 1 WHEN 'refund' THEN -1 ELSE 0 END),0) FROM billing_ledger WHERE customer_id=? AND created_at >= ? AND created_at < ?`, customerID, from, to)
+	return n, err
+}
+
+func monthBounds(t time.Time) (string, string) {
+	t = t.UTC()
+	start := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return start.Format(time.RFC3339), start.AddDate(0, 1, 0).Format(time.RFC3339)
+}
+
+// Charge debits one usage. The ref is the verification id, so a retry cannot
+// charge twice. A zero price charges nothing.
+func (s *Service) Charge(ctx context.Context, customerID string, p Price, ref string) (Entry, error) {
+	if p.Minor == 0 {
+		return Entry{}, nil
+	}
+	return s.post(ctx, customerID, p.MeterID, p.Currency, KindUsage, -p.Minor, ref, "")
+}
+
+// Refund returns a charge (the usage was denied after the debit).
+func (s *Service) Refund(ctx context.Context, customerID string, p Price, ref string) error {
+	if p.Minor == 0 {
+		return nil
+	}
+	_, err := s.post(ctx, customerID, p.MeterID, p.Currency, KindRefund, p.Minor, ref, "")
+	return err
+}
+
+// post applies a signed amount to the account and writes the ledger row in one
+// transaction. A debit succeeds only if the balance stays above -credit_limit.
+func (s *Service) post(ctx context.Context, customerID, meterID, currency, kind string, amount int64, ref, actor string) (Entry, error) {
+	tx, err := s.DB.BeginTxx(ctx, nil)
+	if err != nil {
+		return Entry{}, err
+	}
+	defer tx.Rollback()
+	if ref != "" {
+		var prior Entry
+		err := tx.GetContext(ctx, &prior, `SELECT id, customer_id, meter_id, currency, kind, amount_minor, balance_after, ref, created_at FROM billing_ledger WHERE customer_id=? AND kind=? AND ref=?`, customerID, kind, ref)
+		if err == nil {
+			return prior, nil // already applied
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return Entry{}, err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE billing_accounts SET balance_minor = balance_minor + ?
+		WHERE customer_id=? AND currency=? AND balance_minor + ? >= -credit_limit_minor`, amount, customerID, currency, amount)
+	if err != nil {
+		return Entry{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var exists int
+		_ = tx.GetContext(ctx, &exists, `SELECT COUNT(*) FROM billing_accounts WHERE customer_id=? AND currency=?`, customerID, currency)
+		if exists == 0 {
+			return Entry{}, ErrNoAccount
+		}
+		return Entry{}, ErrInsufficient
+	}
+	var bal int64
+	if err := tx.GetContext(ctx, &bal, `SELECT balance_minor FROM billing_accounts WHERE customer_id=? AND currency=?`, customerID, currency); err != nil {
+		return Entry{}, err
+	}
+	e := Entry{ID: modules.NewID(), CustomerID: customerID, MeterID: meterID, Currency: currency, Kind: kind, AmountMinor: amount, BalanceAfter: bal, Ref: ref, CreatedAt: s.Stamp()}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO billing_ledger (id, customer_id, meter_id, currency, kind, amount_minor, balance_after, ref, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		e.ID, e.CustomerID, e.MeterID, e.Currency, e.Kind, e.AmountMinor, e.BalanceAfter, e.Ref, e.CreatedAt); err != nil {
+		return Entry{}, err
+	}
+	// Low-balance warning: raised once when a debit takes the balance under the
+	// level, re-armed when the balance is back over it.
+	var acct struct {
+		Low      int64 `db:"low_balance_minor"`
+		Notified int   `db:"low_notified"`
+	}
+	crossed := false
+	if err := tx.GetContext(ctx, &acct, `SELECT low_balance_minor, low_notified FROM billing_accounts WHERE customer_id=? AND currency=?`, customerID, currency); err == nil && acct.Low > 0 {
+		switch {
+		case amount < 0 && bal < acct.Low && acct.Notified == 0:
+			if _, err := tx.ExecContext(ctx, `UPDATE billing_accounts SET low_notified=1 WHERE customer_id=? AND currency=?`, customerID, currency); err != nil {
+				return Entry{}, err
+			}
+			crossed = true
+		case amount > 0 && bal >= acct.Low && acct.Notified == 1:
+			if _, err := tx.ExecContext(ctx, `UPDATE billing_accounts SET low_notified=0 WHERE customer_id=? AND currency=?`, customerID, currency); err != nil {
+				return Entry{}, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Entry{}, err
+	}
+	switch kind {
+	case KindTopUp:
+		_ = s.Audit.Append(ctx, actor, "billing.topup", customerID, map[string]any{"currency": currency, "amount": amount, "ref": ref})
+	case KindPayRefund, KindAdjust:
+		_ = s.Audit.Append(ctx, actor, "billing."+kind, customerID, map[string]any{"currency": currency, "amount": amount, "ref": ref})
+	}
+	if crossed && s.OnLowBalance != nil {
+		s.OnLowBalance(context.WithoutCancel(ctx), customerID, currency, bal, acct.Low)
+	}
+	return e, nil
+}
+
+// Statement returns the newest ledger rows first.
+func (s *Service) Statement(ctx context.Context, customerID, currency string, limit int) ([]Entry, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	q := `SELECT id, customer_id, meter_id, currency, kind, amount_minor, balance_after, ref, created_at FROM billing_ledger WHERE customer_id=?`
+	args := []any{customerID}
+	if currency != "" {
+		q += ` AND currency=?`
+		args = append(args, currency)
+	}
+	q += ` ORDER BY created_at DESC, rowid DESC LIMIT ?`
+	args = append(args, limit)
+	var out []Entry
+	err := s.DB.SelectContext(ctx, &out, q, args...)
+	return out, err
+}
+
+// Money formats minor units, e.g. 1000 USD -> "USD 10.00" (two decimals).
+func Money(currency string, minor int64) string {
+	sign := ""
+	if minor < 0 {
+		sign, minor = "-", -minor
+	}
+	return fmt.Sprintf("%s%s %d.%02d", sign, currency, minor/100, minor%100)
+}
+
+// WriteCSV writes a statement. Cells that could be read as spreadsheet
+// formulas are neutralised.
+func WriteCSV(w io.Writer, entries []Entry) error {
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"time", "kind", "currency", "amount", "balance_after", "meter", "ref"})
+	for _, e := range entries {
+		_ = cw.Write([]string{e.CreatedAt, e.Kind, e.Currency, formatMinor(e.AmountMinor), formatMinor(e.BalanceAfter), safeCell(e.MeterID), safeCell(e.Ref)})
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+func formatMinor(m int64) string {
+	sign := ""
+	if m < 0 {
+		sign, m = "-", -m
+	}
+	return sign + strconv.FormatInt(m/100, 10) + "." + fmt.Sprintf("%02d", m%100)
+}
+
+func safeCell(s string) string {
+	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
+		return "'" + s
+	}
+	return s
+}

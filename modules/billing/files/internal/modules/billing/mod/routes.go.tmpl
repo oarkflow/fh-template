@@ -1,0 +1,364 @@
+package mod
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"strings"
+
+	appauth "__FH_MODULE__/internal/auth"
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/billing"
+	"__FH_MODULE__/internal/modules/billing/payments"
+	"__FH_MODULE__/internal/modules/settings"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/fh/mw/contract"
+)
+
+// Permissions the module enforces (resource:action):
+//
+//	billing:read    see your own balance, statement and invoices
+//	billing:pay     buy credit online and set your warning level
+//	billing:manage  administrators: any customer's account, top-ups, refunds, rates, tiers, meters
+var Permissions = []string{"billing:read", "billing:pay", "billing:manage"}
+
+func jsonBody(max int) fh.HandlerFunc {
+	return contract.New(contract.Config{Methods: []string{"POST", "PUT", "DELETE"}, ContentTypes: []string{"application/json"}, MaxBodyBytes: max})
+}
+
+func bind(c fh.Ctx, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(c.BodyCopy()))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_JSON", "request body is not valid for this endpoint")
+	}
+	return nil
+}
+
+type tenantDirectory interface {
+	TenantOf(ctx context.Context, id string) (string, bool)
+}
+
+func register(d *modules.Deps, cfg *settings.Settings, svc *billing.Service, pricing *billing.Pricing, pay *payments.Service) {
+	registerPayReturn(d, pay)
+
+	self := d.API.Group("/billing")
+	principal := func(c fh.Ctx) fh.Principal { p, _ := appauth.Principal(c); return p }
+	tenant := func(c fh.Ctx) string { return cfg.Tenant(principal(c).TenantID) }
+	upper := strings.ToUpper
+	throttled := func(c fh.Ctx, event string) bool {
+		if d.Guard == nil {
+			return false
+		}
+		blocked, err := d.Guard.EmitBusinessEvent(c, event, 0)
+		return err == nil && blocked
+	}
+
+	// ---- the caller's own billing ----
+	self.Get("", d.Require("billing:read"), func(c fh.Ctx) error {
+		id := customerOf(cfg, c)
+		accts, err := svc.Accounts(c.Context(), id)
+		if err != nil {
+			return err
+		}
+		recent, err := svc.Statement(c.Context(), id, c.Query("currency"), 50)
+		if err != nil {
+			return err
+		}
+		orders, err := pay.Orders(c.Context(), id, 20)
+		if err != nil {
+			return err
+		}
+		meters, err := pricing.Meters(c.Context(), id)
+		if err != nil {
+			return err
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"accounts": accts, "recent": recent, "checkout": pay.Info(), "orders": orders, "meters": meters})
+	}).Name("billing").Tag("billing")
+
+	// Pay online: the caller chooses how many top-up packs to buy and is sent to
+	// the payment gateway. The balance is credited only when the gateway's signed
+	// return reaches /pay/return, never by this call.
+	self.Post("/checkout", d.Require("billing:pay"), jsonBody(1<<10), func(c fh.Ctx) error {
+		if throttled(c, "billing.checkout") {
+			return fh.NewHTTPError(fh.StatusTooManyRequests, "ANOMALY_DETECTED", "too many requests")
+		}
+		var in struct {
+			Units int64 `json:"units"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		p := principal(c)
+		co, err := pay.Start(c.Context(), tenant(c), customerOf(cfg, c), p.ID, in.Units)
+		if err != nil {
+			return err
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.Status(fh.StatusCreated).JSON(co)
+	}).Name("billing-checkout").Tag("billing")
+
+	self.Put("/alert", d.Require("billing:pay"), jsonBody(1<<10), func(c fh.Ctx) error {
+		var in struct {
+			Currency string `json:"currency"`
+			Level    int64  `json:"levelMinor"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := svc.SetLowBalance(c.Context(), principal(c).ID, customerOf(cfg, c), upper(in.Currency), in.Level); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("billing-alert").Tag("billing")
+
+	self.Get("/invoice", d.Require("billing:read"), func(c fh.Ctx) error {
+		id := customerOf(cfg, c)
+		cur := upper(c.Query("currency"))
+		if cur == "" {
+			accts, err := svc.Accounts(c.Context(), id)
+			if err != nil || len(accts) == 0 {
+				return fh.NewHTTPError(fh.StatusNotFound, "NO_ACCOUNT", "no billing account yet")
+			}
+			cur = accts[0].Currency
+		}
+		inv, err := svc.Invoice(c.Context(), id, cur, c.Query("month"))
+		if err != nil {
+			return err
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(inv)
+	}).Name("billing-invoice").Tag("billing")
+
+	self.Get("/statement.csv", d.Require("billing:read"), func(c fh.Ctx) error {
+		rows, err := svc.Statement(c.Context(), customerOf(cfg, c), c.Query("currency"), 1000)
+		if err != nil {
+			return err
+		}
+		var buf bytes.Buffer
+		if err := billing.WriteCSV(&buf, rows); err != nil {
+			return err
+		}
+		c.Set("Content-Type", "text/csv; charset=utf-8")
+		c.Set("Content-Disposition", `attachment; filename="statement.csv"`)
+		c.Set("Cache-Control", "no-store")
+		return c.Send(buf.Bytes())
+	}).Name("billing-statement").Tag("billing")
+
+	// ---- administrators ----
+	admin := d.API.Group("/billing/admin", d.Require("billing:manage"))
+	// inTenant refuses a customer that belongs to another tenant.
+	inTenant := func(c fh.Ctx, id string) error {
+		if !cfg.MultiTenant() || id == tenant(c) {
+			return nil
+		}
+		if v, ok := d.Lookup("accounts"); ok {
+			if dir, ok := v.(tenantDirectory); ok {
+				if t, found := dir.TenantOf(c.Context(), id); found && t == tenant(c) {
+					return nil
+				}
+			}
+		}
+		return fh.NewHTTPError(fh.StatusNotFound, "NOT_FOUND", "customer not found")
+	}
+	type money struct {
+		Currency string `json:"currency"`
+		Amount   int64  `json:"amountMinor"`
+		Ref      string `json:"ref"`
+		Reason   string `json:"reason"`
+	}
+
+	admin.Get("/customers/:id", func(c fh.Ctx) error {
+		id := c.Param("id")
+		if err := inTenant(c, id); err != nil {
+			return err
+		}
+		accts, err := svc.Accounts(c.Context(), id)
+		if err != nil {
+			return err
+		}
+		meters, err := pricing.Meters(c.Context(), id)
+		if err != nil {
+			return err
+		}
+		recent, err := svc.Statement(c.Context(), id, "", 30)
+		if err != nil {
+			return err
+		}
+		orders, err := pay.Orders(c.Context(), id, 20)
+		if err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"customerId": id, "accounts": accts, "meters": meters, "recent": recent, "orders": orders})
+	}).Name("billing-customer").Tag("admin")
+
+	admin.Put("/customers/:id/account", jsonBody(1<<10), func(c fh.Ctx) error {
+		if err := inTenant(c, c.Param("id")); err != nil {
+			return err
+		}
+		var in struct {
+			Currency    string `json:"currency"`
+			CreditLimit int64  `json:"creditLimitMinor"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := svc.OpenAccount(c.Context(), principal(c).ID, c.Param("id"), upper(in.Currency), in.CreditLimit); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("billing-account").Tag("admin")
+
+	admin.Post("/customers/:id/topup", jsonBody(1<<10), func(c fh.Ctx) error {
+		if err := inTenant(c, c.Param("id")); err != nil {
+			return err
+		}
+		var in money
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		e, err := svc.TopUp(c.Context(), principal(c).ID, c.Param("id"), upper(in.Currency), in.Amount, in.Ref)
+		if err != nil {
+			return err
+		}
+		return c.JSON(e)
+	}).Name("billing-topup").Tag("admin")
+
+	// Money back to a customer (a payment refunded outside the platform) and
+	// corrections both need a reference and a reason, and are in the audit trail.
+	admin.Post("/customers/:id/refund", jsonBody(1<<10), func(c fh.Ctx) error {
+		if err := inTenant(c, c.Param("id")); err != nil {
+			return err
+		}
+		var in money
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		e, err := svc.RefundPayment(c.Context(), principal(c).ID, c.Param("id"), upper(in.Currency), in.Amount, in.Ref, in.Reason)
+		if err != nil {
+			return err
+		}
+		return c.JSON(e)
+	}).Name("billing-refund").Tag("admin")
+
+	admin.Post("/customers/:id/adjust", jsonBody(1<<10), func(c fh.Ctx) error {
+		if err := inTenant(c, c.Param("id")); err != nil {
+			return err
+		}
+		var in money
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		e, err := svc.Adjust(c.Context(), principal(c).ID, c.Param("id"), upper(in.Currency), in.Amount, in.Ref, in.Reason)
+		if err != nil {
+			return err
+		}
+		return c.JSON(e)
+	}).Name("billing-adjust").Tag("admin")
+
+	admin.Put("/customers/:id/alert", jsonBody(1<<10), func(c fh.Ctx) error {
+		if err := inTenant(c, c.Param("id")); err != nil {
+			return err
+		}
+		var in struct {
+			Currency string `json:"currency"`
+			Level    int64  `json:"levelMinor"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := svc.SetLowBalance(c.Context(), principal(c).ID, c.Param("id"), upper(in.Currency), in.Level); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("billing-admin-alert").Tag("admin")
+
+	admin.Post("/customers/:id/meters", jsonBody(4<<10), func(c fh.Ctx) error {
+		if err := inTenant(c, c.Param("id")); err != nil {
+			return err
+		}
+		var in struct {
+			Plan     string `json:"plan"`
+			Name     string `json:"name"`
+			Currency string `json:"currency"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		m, err := pricing.RegisterMeter(c.Context(), principal(c).ID, tenant(c), in.Plan, c.Param("id"), in.Name, upper(in.Currency))
+		if err != nil {
+			return err
+		}
+		return c.Status(fh.StatusCreated).JSON(m)
+	}).Name("meter-register").Tag("admin")
+
+	admin.Delete("/customers/:id/meters/:meter", func(c fh.Ctx) error {
+		if err := inTenant(c, c.Param("id")); err != nil {
+			return err
+		}
+		if err := pricing.DisableMeter(c.Context(), principal(c).ID, c.Param("id"), c.Param("meter")); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("meter-disable").Tag("admin")
+
+	admin.Put("/meters/:id/price", jsonBody(1<<10), func(c fh.Ctx) error {
+		var in struct {
+			PriceMinor int64 `json:"priceMinor"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := pricing.SetMeterPrice(c.Context(), principal(c).ID, c.Param("id"), in.PriceMinor); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("meter-price").Tag("admin")
+
+	admin.Put("/rates", jsonBody(1<<10), func(c fh.Ctx) error {
+		var in struct {
+			Plan       string `json:"plan"`
+			Currency   string `json:"currency"`
+			PriceMinor int64  `json:"priceMinor"`
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := pricing.SetRate(c.Context(), principal(c).ID, tenant(c), in.Plan, upper(in.Currency), in.PriceMinor); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("rate-set").Tag("admin")
+
+	admin.Get("/tiers", func(c fh.Ctx) error {
+		t, err := pricing.Tiers(c.Context(), tenant(c))
+		if err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"tiers": t})
+	}).Name("tiers").Tag("admin")
+
+	admin.Put("/tiers", jsonBody(1<<10), func(c fh.Ctx) error {
+		var in billing.Tier
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		in.Currency = upper(in.Currency)
+		if err := pricing.SetTier(c.Context(), principal(c).ID, tenant(c), in); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("tier-set").Tag("admin")
+
+	admin.Delete("/tiers", jsonBody(1<<10), func(c fh.Ctx) error {
+		var in billing.Tier
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := pricing.DeleteTier(c.Context(), principal(c).ID, tenant(c), in.Plan, upper(in.Currency), in.FromUnits); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("tier-delete").Tag("admin")
+}

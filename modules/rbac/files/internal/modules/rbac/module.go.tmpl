@@ -1,0 +1,249 @@
+package rbac
+
+import (
+	"context"
+	"embed"
+	"encoding/json"
+	"io/fs"
+	"strings"
+
+	appauth "__FH_MODULE__/internal/auth"
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/settings"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/fh/mw/contract"
+)
+
+//go:embed sql/*.sql
+var migrations embed.FS
+
+// ServiceName is the key for modules.Service[*Service].
+const ServiceName = "rbac"
+
+type module struct{}
+
+// Module returns the rbac module for internal/modules/enabled.
+func Module() modules.Module { return module{} }
+
+func (module) Name() string { return ServiceName }
+
+func (module) Migrations() fs.FS {
+	sub, _ := fs.Sub(migrations, "sql")
+	return sub
+}
+
+// accountDirectory is what rbac optionally uses from the accounts module.
+type accountDirectory interface {
+	TenantOf(ctx context.Context, id string) (string, bool)
+	StepUpRequired(ctx context.Context, id string) bool
+	CheckStepUp(ctx context.Context, id, code string) bool
+}
+
+func (module) Register(ctx context.Context, d *modules.Deps) error {
+	cfg, err := modules.Service[*settings.Settings](d, settings.ServiceName)
+	if err != nil {
+		return err
+	}
+	al, err := modules.Service[*audit.Log](d, audit.ServiceName)
+	if err != nil {
+		return err
+	}
+	svc, err := New(ctx, d.DB, al, FromSettings(cfg.Roles))
+	if err != nil {
+		return err
+	}
+	svc.Declare(
+		Permission{Action: "manage", Resource: "rbac"}, Permission{Action: "read", Resource: "accounts"},
+		Permission{Action: "write", Resource: "accounts"}, Permission{Action: "read", Resource: "audit"},
+	)
+	d.Provide(ServiceName, svc)
+	d.DeclarePermissions("rbac:manage")
+
+	directory := func() accountDirectory {
+		v, _ := d.Lookup("accounts")
+		a, _ := v.(accountDirectory)
+		return a
+	}
+	svc.AccountTenant = func(ctx context.Context, id string) (string, bool) {
+		if a := directory(); a != nil {
+			return a.TenantOf(ctx, id)
+		}
+		return "", true // no account directory: grants are not tenant-checked here
+	}
+
+	tenantOf := func(c fh.Ctx) string {
+		p, _ := appauth.Principal(c)
+		return cfg.Tenant(p.TenantID)
+	}
+	// Every module's d.Require(...) now asks rbac.
+	d.Authorize = func(c fh.Ctx, permission string) bool {
+		p, ok := appauth.Principal(c)
+		if !ok {
+			return false
+		}
+		resource, action, found := strings.Cut(permission, ":")
+		if !found {
+			return false
+		}
+		tenant := cfg.Tenant(p.TenantID)
+		for _, role := range p.Roles {
+			if svc.Check(c.Context(), tenant, p.ID, role, action, resource) {
+				return true
+			}
+		}
+		return false
+	}
+	registerRoutes(d, svc, tenantOf, directory)
+	return nil
+}
+
+var body = contract.New(contract.Config{Methods: []string{"POST", "PUT", "DELETE"}, ContentTypes: []string{"application/json"}, MaxBodyBytes: 16 << 10})
+
+func bind(c fh.Ctx, into any) error {
+	if len(c.BodyCopy()) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(c.BodyCopy(), into); err != nil {
+		return fh.NewHTTPError(fh.StatusBadRequest, "INVALID_JSON", "invalid JSON")
+	}
+	return nil
+}
+
+// registerRoutes mounts role and grant management. Reading needs rbac:manage;
+// every change also needs a fresh authenticator code when the caller has one
+// enrolled, and is recorded in the change history (with rollback).
+func registerRoutes(d *modules.Deps, svc *Service, tenantOf func(fh.Ctx) string, directory func() accountDirectory) {
+	r := d.API.Group("/rbac", d.Require("rbac:manage"))
+	who := func(c fh.Ctx) Actor {
+		p, _ := appauth.Principal(c)
+		role := ""
+		if len(p.Roles) > 0 {
+			role = p.Roles[0]
+		}
+		return Actor{ID: p.ID, Role: role, Tenant: tenantOf(c)}
+	}
+	stepUp := func(c fh.Ctx, code string) error {
+		p, _ := appauth.Principal(c)
+		if a := directory(); a != nil && a.StepUpRequired(c.Context(), p.ID) && !a.CheckStepUp(c.Context(), p.ID, code) {
+			return fh.NewHTTPError(fh.StatusForbidden, "STEP_UP_REQUIRED", "a fresh authenticator code is required to change access")
+		}
+		return nil
+	}
+	type stepUpBody struct {
+		StepUp string `json:"totp"`
+	}
+
+	r.Get("/roles", func(c fh.Ctx) error {
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(fh.Map{"roles": svc.Roles(c.Context(), tenantOf(c)), "catalog": svc.Catalog()})
+	}).Name("rbac-roles").Tag("admin")
+
+	r.Put("/roles/:id", body, func(c fh.Ctx) error {
+		var in struct {
+			Name        string       `json:"name"`
+			Permissions []Permission `json:"permissions"`
+			Inherits    []string     `json:"inherits"`
+			Note        string       `json:"note"`
+			stepUpBody
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := stepUp(c, in.StepUp); err != nil {
+			return err
+		}
+		saved, err := svc.SaveRole(c.Context(), who(c), Role{ID: c.Param("id"), Name: in.Name, Permissions: in.Permissions, Inherits: in.Inherits}, in.Note)
+		if err != nil {
+			return err
+		}
+		return c.JSON(saved)
+	}).Name("rbac-role-put").Tag("admin")
+
+	r.Delete("/roles/:id", body, func(c fh.Ctx) error {
+		var in stepUpBody
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := stepUp(c, in.StepUp); err != nil {
+			return err
+		}
+		if err := svc.DeleteRole(c.Context(), who(c), c.Param("id")); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("rbac-role-delete").Tag("admin")
+
+	r.Get("/members", func(c fh.Ctx) error {
+		m, err := svc.Members(c.Context(), tenantOf(c), c.Query("accountId"))
+		if err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"members": m})
+	}).Name("rbac-members").Tag("admin")
+
+	r.Post("/members", body, func(c fh.Ctx) error {
+		var in struct {
+			AccountID string `json:"accountId"`
+			RoleID    string `json:"roleId"`
+			stepUpBody
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := stepUp(c, in.StepUp); err != nil {
+			return err
+		}
+		if err := svc.Grant(c.Context(), who(c), in.AccountID, in.RoleID); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusCreated).JSON(fh.Map{"accountId": in.AccountID, "roleId": in.RoleID})
+	}).Name("rbac-grant").Tag("admin")
+
+	r.Delete("/members/:account/:role", body, func(c fh.Ctx) error {
+		var in stepUpBody
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := stepUp(c, in.StepUp); err != nil {
+			return err
+		}
+		if err := svc.Revoke(c.Context(), who(c), c.Param("account"), c.Param("role")); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("rbac-revoke").Tag("admin")
+
+	r.Get("/history", func(c fh.Ctx) error {
+		h, err := svc.History(c.Context(), tenantOf(c))
+		if err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"revisions": h})
+	}).Name("rbac-history").Tag("admin")
+
+	r.Post("/rollback", body, func(c fh.Ctx) error {
+		var in struct {
+			Rev int64 `json:"rev"`
+			stepUpBody
+		}
+		if err := bind(c, &in); err != nil {
+			return err
+		}
+		if err := stepUp(c, in.StepUp); err != nil {
+			return err
+		}
+		if err := svc.Rollback(c.Context(), who(c), in.Rev); err != nil {
+			return err
+		}
+		return c.Status(fh.StatusNoContent).Send(nil)
+	}).Name("rbac-rollback").Tag("admin")
+
+	r.Get("/denials", func(c fh.Ctx) error {
+		out, err := svc.Denials(c.Context(), tenantOf(c), 100)
+		if err != nil {
+			return err
+		}
+		return c.JSON(fh.Map{"denials": out})
+	}).Name("rbac-denials").Tag("admin")
+}

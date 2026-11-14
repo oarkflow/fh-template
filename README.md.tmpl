@@ -38,6 +38,14 @@ wrapper, not a requirement. Real environment variables always take priority
 over `.env`, so orchestrated deployments that inject secrets directly (Docker,
 systemd, Kubernetes) behave the same whether or not a `.env` file is present.
 
+## Opt-in modules
+
+Features such as accounts & RBAC, BCL-driven workflows and billing are not part of the
+base scaffold. Add them when generating (`fh-init -with accounts,rbac,workflow,billing`)
+or list what is available with `fh-init -list-modules`. See `modules/README.md` in the
+template repository for configuration (`config/app.bcl`) and permissions.
+Enabled modules are listed in `internal/modules/enabled/enabled.go`.
+
 ## First-run setup
 
 ### Development defaults

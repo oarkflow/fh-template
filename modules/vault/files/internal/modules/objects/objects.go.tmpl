@@ -1,0 +1,148 @@
+// Package objects is the blob store for encrypted documents and liveness media.
+// Callers encrypt before Put; the store never sees plaintext PII.
+package objects
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+)
+
+var ErrNotFound = errors.New("objects: not found")
+
+type Store interface {
+	Put(key string, data []byte) error
+	Get(key string) ([]byte, error)
+	Delete(key string) error
+	DeletePrefix(prefix string) (int, error)
+}
+
+var keyRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9/_.\-]{0,200}$`)
+
+func validKey(k string) bool {
+	return keyRe.MatchString(k) && !strings.Contains(k, "..") && !strings.Contains(k, "//")
+}
+
+// FS stores objects under a root directory with 0600 permissions.
+type FS struct{ Root string }
+
+func (f FS) path(key string) (string, error) {
+	if !validKey(key) {
+		return "", errors.New("objects: invalid key")
+	}
+	return filepath.Join(f.Root, filepath.FromSlash(key)), nil
+}
+
+func (f FS) Put(key string, data []byte) error {
+	p, err := f.path(key)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
+func (f FS) Get(key string) ([]byte, error) {
+	p, err := f.path(key)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	return b, err
+}
+
+func (f FS) Delete(key string) error {
+	p, err := f.path(key)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (f FS) DeletePrefix(prefix string) (int, error) {
+	p, err := f.path(strings.TrimSuffix(prefix, "/"))
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	_ = filepath.Walk(p, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			n++
+		}
+		return nil
+	})
+	if err := os.RemoveAll(p); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// Memory is an in-process store for tests.
+type Memory struct {
+	mu sync.Mutex
+	m  map[string][]byte
+}
+
+func NewMemory() *Memory { return &Memory{m: map[string][]byte{}} }
+
+func (s *Memory) Put(key string, data []byte) error {
+	if !validKey(key) {
+		return errors.New("objects: invalid key")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m[key] = append([]byte(nil), data...)
+	return nil
+}
+func (s *Memory) Get(key string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.m[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return append([]byte(nil), b...), nil
+}
+func (s *Memory) Delete(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, key)
+	return nil
+}
+func (s *Memory) DeletePrefix(prefix string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k := range s.m {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.m, k)
+			n++
+		}
+	}
+	return n, nil
+}
+func (s *Memory) Keys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for k := range s.m {
+		out = append(out, k)
+	}
+	return out
+}

@@ -1,0 +1,31 @@
+package billing
+
+import (
+	"time"
+
+	"__FH_MODULE__/internal/modules/audit"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/squealx"
+)
+
+// Deps is what billing needs from the host.
+type Deps struct {
+	DB    *squealx.DB
+	Audit *audit.Log
+	Now   func() time.Time
+}
+
+func (d Deps) Time() time.Time {
+	if d.Now != nil {
+		return d.Now()
+	}
+	return time.Now()
+}
+
+// Stamp returns the current UTC time as RFC3339.
+func (d Deps) Stamp() string { return d.Time().UTC().Format(time.RFC3339) }
+
+// Err builds an HTTP error carrying a stable code.
+func Err(status int, code, format string, args ...any) error {
+	return fh.NewHTTPError(status, code, sprintf(format, args...))
+}

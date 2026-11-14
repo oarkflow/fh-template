@@ -1,0 +1,512 @@
+// Package accounts provides the builtin account store, OTP-verified
+// registration, TOTP enrolment, account management and the login verifier that
+// consults the datasources configured in config/app.bcl.
+package accounts
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/big"
+	"net/mail"
+	"strings"
+	"time"
+
+	"__FH_MODULE__/internal/modules"
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/settings"
+	"__FH_MODULE__/internal/modules/vault"
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/squealx"
+)
+
+// Notifier delivers one-time codes and notices.
+type Notifier interface {
+	Send(ctx context.Context, channel, to, kind, message string) error
+}
+
+type Account struct {
+	ID           string `db:"id" json:"id"`
+	TenantID     string `db:"tenant_id" json:"tenantId"`
+	Role         string `db:"role" json:"role"`
+	Name         string `db:"name" json:"name"`
+	EmailBidx    string `db:"email_bidx" json:"-"`
+	PhoneBidx    string `db:"phone_bidx" json:"-"`
+	ContactEnc   string `db:"contact_enc" json:"-"`
+	PasswordHash string `db:"password_hash" json:"-"`
+	TOTPSecret   string `db:"totp_secret_enc" json:"-"`
+	TOTPEnabled  int    `db:"totp_enabled" json:"totpEnabled"`
+	Status       string `db:"status" json:"status"`
+	CreatedAt    string `db:"created_at" json:"createdAt"`
+}
+
+const accountCols = `id, tenant_id, role, name, email_bidx, phone_bidx, contact_enc, password_hash, totp_secret_enc, totp_enabled, status, created_at`
+
+type Contact struct {
+	Email string `json:"email,omitempty"`
+	Phone string `json:"phone,omitempty"`
+}
+
+// Service is the account store.
+type Service struct {
+	DB       *squealx.DB
+	Vault    *vault.Vault
+	Audit    *audit.Log
+	Settings *settings.Settings
+	Notify   Notifier
+	Params   Params
+	Now      func() time.Time
+
+	dummy string
+}
+
+// New builds the service; Params defaults to DefaultParams.
+func New(db *squealx.DB, v *vault.Vault, a *audit.Log, cfg *settings.Settings, n Notifier, p Params) *Service {
+	if p == (Params{}) {
+		p = DefaultParams
+	}
+	s := &Service{DB: db, Vault: v, Audit: a, Settings: cfg, Notify: n, Params: p}
+	s.dummy, _ = HashPassword("dummy-password-for-timing", p)
+	return s
+}
+
+func (s *Service) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
+}
+func (s *Service) stamp() string { return s.now().UTC().Format(time.RFC3339) }
+
+func (s *Service) log(ctx context.Context, actor, action, object string, meta map[string]any) {
+	if s.Audit != nil {
+		_ = s.Audit.Append(ctx, actor, action, object, meta)
+	}
+}
+
+// Err builds an HTTP error carrying a stable code.
+func Err(status int, code, format string, args ...any) error {
+	return fh.NewHTTPError(status, code, fmt.Sprintf(format, args...))
+}
+
+// find locates a builtin account by email or phone.
+func (s *Service) find(ctx context.Context, tenant, identifier string) (Account, error) {
+	var a Account
+	q := `SELECT ` + accountCols + ` FROM accounts WHERE tenant_id=? AND `
+	if strings.Contains(identifier, "@") {
+		return a, s.DB.GetContext(ctx, &a, q+`email_bidx=?`, tenant, s.Vault.BlindIndex("email", identifier))
+	}
+	return a, s.DB.GetContext(ctx, &a, q+`phone_bidx=?`, tenant, s.Vault.BlindIndex("phone", identifier))
+}
+
+func (s *Service) Get(ctx context.Context, id string) (Account, error) {
+	var a Account
+	err := s.DB.GetContext(ctx, &a, `SELECT `+accountCols+` FROM accounts WHERE id=?`, id)
+	return a, err
+}
+
+// create inserts an account with the given role and status.
+func (s *Service) create(ctx context.Context, tenant string, c Contact, name, password, role, status string) (Account, error) {
+	if c.Email == "" && c.Phone == "" {
+		return Account{}, Err(400, "CONTACT_REQUIRED", "an email or phone number is required")
+	}
+	if c.Email != "" {
+		if _, err := mail.ParseAddress(c.Email); err != nil {
+			return Account{}, Err(400, "INVALID_EMAIL", "email address is not valid")
+		}
+	}
+	if c.Phone != "" && len(digits(c.Phone)) < 7 {
+		return Account{}, Err(400, "INVALID_PHONE", "phone number is not valid")
+	}
+	if err := checkPassword(password, s.Settings.Auth.MinPasswordLength); err != nil {
+		return Account{}, err
+	}
+	if _, ok := s.Settings.Role(role); !ok {
+		return Account{}, Err(400, "INVALID_ROLE", "unknown role %q", role)
+	}
+	hash, err := HashPassword(password, s.Params)
+	if err != nil {
+		return Account{}, err
+	}
+	id := modules.NewID()
+	a := Account{ID: id, TenantID: tenant, Role: role, Name: name, PasswordHash: hash, Status: status, CreatedAt: s.stamp()}
+	if c.Email != "" {
+		a.EmailBidx = s.Vault.BlindIndex("email", c.Email)
+	}
+	if c.Phone != "" {
+		a.PhoneBidx = s.Vault.BlindIndex("phone", c.Phone)
+	}
+	raw, _ := json.Marshal(c)
+	if a.ContactEnc, err = s.Vault.Encrypt(id, "accounts", "contact", id, raw); err != nil {
+		return Account{}, err
+	}
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO accounts (`+accountCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.TenantID, a.Role, a.Name, a.EmailBidx, a.PhoneBidx, a.ContactEnc, a.PasswordHash, "", 0, a.Status, a.CreatedAt)
+	if err != nil {
+		_ = s.Vault.Shred(id)
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return Account{}, Err(409, "CONTACT_IN_USE", "that contact is already registered")
+		}
+		return Account{}, err
+	}
+	return a, nil
+}
+
+// Register creates a pending account with the registration default role and
+// sends a verification code. It reveals nothing about whether a contact is
+// already registered beyond a generic conflict.
+func (s *Service) Register(ctx context.Context, tenant string, c Contact, name, password string) (string, string, error) {
+	if !s.Settings.Registration.Enabled {
+		return "", "", Err(404, "REGISTRATION_DISABLED", "registration is not available")
+	}
+	status := "pending"
+	if s.Settings.Registration.Verify == "none" {
+		status = "active"
+	}
+	a, err := s.create(ctx, s.Settings.Tenant(tenant), c, name, password, s.Settings.Registration.DefaultRole, status)
+	if err != nil {
+		return "", "", err
+	}
+	s.log(ctx, a.ID, "account.register", a.ID, nil)
+	if status == "active" {
+		return a.ID, "", nil
+	}
+	code, err := s.sendOTP(ctx, a, c, "register")
+	return a.ID, code, err
+}
+
+// sendOTP stores a challenge and delivers the code. The code is returned so a
+// development server can show it; callers must drop it in production.
+func (s *Service) sendOTP(ctx context.Context, a Account, c Contact, purpose string) (string, error) {
+	n, _ := rand.Int(rand.Reader, big.NewInt(1000000))
+	code := fmt.Sprintf("%06d", n.Int64())
+	chID := modules.NewID()
+	ttl := s.Settings.Auth.OTPTTLSeconds
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO otp_challenges (id, account_id, purpose, code_hash, attempts, expires_at, used) VALUES (?,?,?,?,0,?,0)`,
+		chID, a.ID, purpose, otpHash(chID, code), s.now().Add(time.Duration(ttl)*time.Second).UTC().Format(time.RFC3339)); err != nil {
+		return "", err
+	}
+	if s.Notify == nil {
+		return "", Err(503, "NOTIFIER_UNAVAILABLE", "no delivery channel is configured for verification codes")
+	}
+	channel, to := "email", c.Email
+	if c.Email == "" {
+		channel, to = "sms", c.Phone
+	}
+	return code, s.Notify.Send(ctx, channel, to, "otp", fmt.Sprintf("Your verification code is %s. It expires in %d minutes.", code, ttl/60))
+}
+
+func otpHash(challengeID, code string) string {
+	h := sha256.Sum256([]byte(challengeID + ":" + code))
+	return hex.EncodeToString(h[:])
+}
+
+const otpMaxAttempts = 5
+
+// VerifyOTP confirms a code. A challenge is single-use and attempt-limited.
+func (s *Service) VerifyOTP(ctx context.Context, accountID, purpose, code string) error {
+	bad := Err(400, "OTP_INVALID", "verification code is invalid or expired")
+	var ch struct {
+		ID       string `db:"id"`
+		CodeHash string `db:"code_hash"`
+		Attempts int    `db:"attempts"`
+		Expires  string `db:"expires_at"`
+	}
+	err := s.DB.GetContext(ctx, &ch, `SELECT id, code_hash, attempts, expires_at FROM otp_challenges WHERE account_id=? AND purpose=? AND used=0 ORDER BY expires_at DESC LIMIT 1`, accountID, purpose)
+	if err != nil {
+		return bad
+	}
+	exp, _ := time.Parse(time.RFC3339, ch.Expires)
+	if s.now().After(exp) || ch.Attempts >= otpMaxAttempts {
+		return bad
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE otp_challenges SET attempts=attempts+1 WHERE id=?`, ch.ID); err != nil {
+		return err
+	}
+	if !hmac.Equal([]byte(otpHash(ch.ID, code)), []byte(ch.CodeHash)) {
+		return bad
+	}
+	res, err := s.DB.ExecContext(ctx, `UPDATE otp_challenges SET used=1 WHERE id=? AND used=0`, ch.ID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return bad // lost a race with a concurrent verification
+	}
+	if purpose == "register" {
+		if _, err := s.DB.ExecContext(ctx, `UPDATE accounts SET status='active' WHERE id=? AND status='pending'`, accountID); err != nil {
+			return err
+		}
+		s.log(ctx, accountID, "account.verify", accountID, nil)
+	}
+	return nil
+}
+
+// BeginTOTP generates a pending secret; ConfirmTOTP enables it once a valid
+// code is shown.
+func (s *Service) BeginTOTP(ctx context.Context, accountID string) (secret, uri string, err error) {
+	secret = NewTOTPSecret()
+	enc, err := s.Vault.Encrypt(accountID, "accounts", "totp", accountID, []byte(secret))
+	if err != nil {
+		return "", "", err
+	}
+	if _, err = s.DB.ExecContext(ctx, `UPDATE accounts SET totp_secret_enc=?, totp_enabled=0 WHERE id=?`, enc, accountID); err != nil {
+		return "", "", err
+	}
+	return secret, TOTPURI(s.Settings.Auth.MFA.Issuer, accountID, secret), nil
+}
+
+func (s *Service) ConfirmTOTP(ctx context.Context, accountID, code string) error {
+	a, err := s.Get(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	secret, err := s.Vault.Decrypt(accountID, "accounts", "totp", accountID, a.TOTPSecret)
+	if err != nil || !VerifyTOTP(string(secret), code, s.now()) {
+		return Err(400, "TOTP_INVALID", "authenticator code is invalid")
+	}
+	_, err = s.DB.ExecContext(ctx, `UPDATE accounts SET totp_enabled=1 WHERE id=?`, accountID)
+	s.log(ctx, accountID, "account.totp_enabled", accountID, nil)
+	return err
+}
+
+// CheckStepUp validates a fresh TOTP code for an account that has TOTP enabled;
+// use it to guard sensitive actions.
+func (s *Service) CheckStepUp(ctx context.Context, accountID, code string) bool {
+	a, err := s.Get(ctx, accountID)
+	if err != nil || a.TOTPEnabled != 1 {
+		return false
+	}
+	secret, err := s.Vault.Decrypt(accountID, "accounts", "totp", accountID, a.TOTPSecret)
+	return err == nil && VerifyTOTP(string(secret), code, s.now())
+}
+
+// ChangePassword replaces a builtin account's password after checking the old one.
+func (s *Service) ChangePassword(ctx context.Context, accountID, current, next string) error {
+	a, err := s.Get(ctx, accountID)
+	if err != nil {
+		return Err(404, "NOT_FOUND", "account not found")
+	}
+	if ok, _ := VerifyPassword(current, a.PasswordHash); !ok {
+		return Err(403, "INVALID_CREDENTIALS", "current password is incorrect")
+	}
+	if err := checkPassword(next, s.Settings.Auth.MinPasswordLength); err != nil {
+		return err
+	}
+	hash, err := HashPassword(next, s.Params)
+	if err != nil {
+		return err
+	}
+	_, err = s.DB.ExecContext(ctx, `UPDATE accounts SET password_hash=? WHERE id=?`, hash, accountID)
+	s.log(ctx, accountID, "account.password_change", accountID, nil)
+	return err
+}
+
+// CreateAccount provisions an active account with any defined role (admin API).
+func (s *Service) CreateAccount(ctx context.Context, actor, tenant string, c Contact, name, password, role string) (Account, error) {
+	a, err := s.create(ctx, s.Settings.Tenant(tenant), c, name, password, role, "active")
+	if err != nil {
+		return a, err
+	}
+	s.log(ctx, actor, "account.create", a.ID, map[string]any{"role": role})
+	return a, nil
+}
+
+// Update changes an account's role and/or status. It refuses to leave a tenant
+// without an active account holding the full-access role.
+func (s *Service) Update(ctx context.Context, actor, tenant, id string, role, status *string) error {
+	a, err := s.Get(ctx, id)
+	if err != nil || a.TenantID != tenant {
+		return Err(404, "NOT_FOUND", "account not found")
+	}
+	newRole, newStatus := a.Role, a.Status
+	if role != nil {
+		if _, ok := s.Settings.Role(*role); !ok {
+			return Err(400, "INVALID_ROLE", "unknown role %q", *role)
+		}
+		newRole = *role
+	}
+	if status != nil {
+		if *status != "active" && *status != "disabled" {
+			return Err(400, "INVALID_STATUS", "status must be active or disabled")
+		}
+		newStatus = *status
+	}
+	if r, ok := s.Settings.Role(a.Role); ok && settings.Grants(r.Permissions, "*") {
+		keeps := false
+		if r2, ok := s.Settings.Role(newRole); ok && settings.Grants(r2.Permissions, "*") && newStatus == "active" {
+			keeps = true
+		}
+		if !keeps {
+			var others int
+			for _, rr := range s.Settings.Roles {
+				if !settings.Grants(rr.Permissions, "*") {
+					continue
+				}
+				var n int
+				if err := s.DB.GetContext(ctx, &n, `SELECT COUNT(*) FROM accounts WHERE tenant_id=? AND role=? AND status='active' AND id<>?`, tenant, rr.ID, id); err != nil {
+					return err
+				}
+				others += n
+			}
+			if others == 0 {
+				return Err(409, "LAST_ADMIN", "this is the last active administrator")
+			}
+		}
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE accounts SET role=?, status=? WHERE id=?`, newRole, newStatus, id); err != nil {
+		return err
+	}
+	s.log(ctx, actor, "account.update", id, map[string]any{"role": newRole, "status": newStatus})
+	return nil
+}
+
+// Member is an account as an administrator sees it.
+type Member struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Role        string `json:"role"`
+	Status      string `json:"status"`
+	Email       string `json:"email"` // masked, enough to recognise a colleague
+	TOTPEnabled bool   `json:"totpEnabled"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+func maskEmail(e string) string {
+	local, domain, ok := strings.Cut(e, "@")
+	if !ok || local == "" {
+		return "—"
+	}
+	keep := 1
+	if len(local) > 3 {
+		keep = 2
+	}
+	return local[:keep] + strings.Repeat("•", 3) + "@" + domain
+}
+
+// List returns the tenant's builtin accounts.
+func (s *Service) List(ctx context.Context, tenant string) ([]Member, error) {
+	var rows []Account
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT `+accountCols+` FROM accounts WHERE tenant_id=? AND status<>'erased' ORDER BY created_at, id`, tenant); err != nil {
+		return nil, err
+	}
+	out := make([]Member, 0, len(rows))
+	for _, a := range rows {
+		m := Member{ID: a.ID, Name: a.Name, Role: a.Role, Status: a.Status, CreatedAt: a.CreatedAt, TOTPEnabled: a.TOTPEnabled == 1, Email: "—"}
+		if raw, err := s.Vault.Decrypt(a.ID, "accounts", "contact", a.ID, a.ContactEnc); err == nil {
+			var c Contact
+			if json.Unmarshal(raw, &c) == nil {
+				m.Email = maskEmail(c.Email)
+			}
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// ContactOf returns the address a message goes to on a channel ("email" or
+// "sms"); for delivery workers only. It is never put in a response.
+func (s *Service) ContactOf(ctx context.Context, id, channel string) (string, bool) {
+	a, err := s.Get(ctx, id)
+	if err != nil || a.Status != "active" {
+		return "", false
+	}
+	raw, err := s.Vault.Decrypt(a.ID, "accounts", "contact", a.ID, a.ContactEnc)
+	if err != nil {
+		return "", false
+	}
+	var c Contact
+	if json.Unmarshal(raw, &c) != nil {
+		return "", false
+	}
+	switch channel {
+	case "email":
+		return c.Email, c.Email != ""
+	case "sms":
+		return c.Phone, c.Phone != ""
+	}
+	return "", false
+}
+
+// Bootstrap creates the first full-access account of a tenant when none exists.
+func (s *Service) Bootstrap(ctx context.Context, tenant, email, password string) (bool, error) {
+	adminRole := ""
+	for _, r := range s.Settings.Roles {
+		if settings.Grants(r.Permissions, "*") {
+			adminRole = r.ID
+			break
+		}
+	}
+	var n int
+	if err := s.DB.GetContext(ctx, &n, `SELECT COUNT(*) FROM accounts WHERE tenant_id=? AND role=?`, tenant, adminRole); err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return false, nil
+	}
+	_, err := s.create(ctx, tenant, Contact{Email: email}, "Administrator", password, adminRole, "active")
+	return err == nil, err
+}
+
+func checkPassword(pw string, min int) error {
+	if len(pw) < min {
+		return Err(400, "WEAK_PASSWORD", "password must be at least %d characters", min)
+	}
+	var lower, upper, digit bool
+	for _, r := range pw {
+		switch {
+		case r >= 'a' && r <= 'z':
+			lower = true
+		case r >= 'A' && r <= 'Z':
+			upper = true
+		case r >= '0' && r <= '9':
+			digit = true
+		}
+	}
+	if !(lower && upper && digit) {
+		return Err(400, "WEAK_PASSWORD", "password must mix upper case, lower case and digits")
+	}
+	return nil
+}
+
+func digits(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isNoRows(err error) bool { return errors.Is(err, sql.ErrNoRows) }
+
+// TenantOf says which tenant a builtin account belongs to.
+func (s *Service) TenantOf(ctx context.Context, id string) (string, bool) {
+	a, err := s.Get(ctx, id)
+	if err != nil {
+		return "", false
+	}
+	return a.TenantID, true
+}
+
+// StepUpRequired reports whether sensitive actions by this account need a fresh
+// authenticator code (it has enrolled one and MFA is not switched off).
+func (s *Service) StepUpRequired(ctx context.Context, id string) bool {
+	a, err := s.Get(ctx, id)
+	return err == nil && a.TOTPEnabled == 1 && s.Settings.Auth.MFA.TOTP != "off"
+}
+
+// Send delivers a message through the configured notifier.
+func (s *Service) Send(ctx context.Context, channel, to, kind, message string) error {
+	if s.Notify == nil {
+		return Err(503, "NOTIFIER_UNAVAILABLE", "no delivery channel is configured")
+	}
+	return s.Notify.Send(ctx, channel, to, kind, message)
+}

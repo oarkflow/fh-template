@@ -1,0 +1,185 @@
+// Package payments takes real money for units. A business tops up its prepaid
+// balance by paying through a payment gateway; the gateway's signed answer, not
+// an administrator typing a number, is what credits the ledger.
+//
+// The gateway is a provider behind a small interface and is chosen by
+// configuration, so a bank or another processor can be added without touching
+// the billing or HTTP code. One provider ships: "orgware", the Orgware
+// payment-link service (orgware.store/pay/...), used the same way as in Aura:
+//
+//	console  the owner picks how many top-up packs to buy; the server opens an
+//	         order and returns the gateway's payment link for that order
+//	gateway  takes the payment, then redirects the browser to this server's
+//	         return URL with a signed set of fields (HMAC-SHA256, version 2)
+//	server   verifies the signature (never the redirect alone), the rate, the
+//	         quantity and the total, then credits the balance once
+//
+// Nothing about the business or its people travels to the gateway: only an
+// opaque order reference and a quantity.
+package payments
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Receipt is what a gateway's return proves. Only signed values appear in it.
+type Receipt struct {
+	Reference     string // the order reference this server gave the gateway
+	Status        string // paid | pending | failed
+	TransactionID string
+	Currency      string
+	UnitMinor     int64
+	Quantity      int64
+	TotalMinor    int64
+}
+
+// LinkOrder is what a gateway needs to build the payment link.
+type LinkOrder struct {
+	Reference string
+	Quantity  int64
+	Redirect  string
+}
+
+// Gateway is a payment provider.
+type Gateway interface {
+	Name() string
+	// Link returns the URL to send the payer to.
+	Link(o LinkOrder) (string, error)
+	// Verify checks a return (its raw query string) and returns the signed facts.
+	// It fails for anything that is not genuinely the gateway's.
+	Verify(rawQuery string, now time.Time) (Receipt, error)
+}
+
+// ErrReturn is the one answer for every way a return can fail to verify, so the
+// endpoint cannot be used to probe order references or signatures.
+var ErrReturn = errors.New("this payment response could not be verified")
+
+// Config selects and parameterises the gateway. The zero value disables online
+// payment: businesses can still be topped up by an administrator.
+type Config struct {
+	// Provider names the gateway ("orgware"). Empty disables online payment.
+	Provider string
+	// LinkURL is the gateway's payment link. {ref}, {quantity}, {redirect},
+	// {amount} and {currency} are replaced (query-escaped). A link with no
+	// placeholders gets reference, quantity and redirect_url appended.
+	LinkURL string
+	// ReturnURL is where the gateway sends the browser back (this server's /pay/return).
+	ReturnURL string
+	// ReturnSecret is the gateway application's redirect signing secret.
+	ReturnSecret string
+	// App is the application name the gateway signs into every return.
+	App string
+	// Currency is the one currency online payment is taken in (USD).
+	Currency string
+	// UnitMinor is the price of one top-up pack in minor units; it must equal the
+	// rate configured on the payment link, and the return's signed rate is checked against it.
+	UnitMinor int64
+	// MinUnits and MaxUnits bound one purchase.
+	MinUnits, MaxUnits int64
+	// OrderLife is how long an order waits for its payment to come back.
+	OrderLife time.Duration
+	// MaxAge is how old a signed return may be.
+	MaxAge time.Duration
+}
+
+// Enabled reports whether online payment is configured.
+func (c Config) Enabled() bool { return c.Provider != "" }
+
+// Validate checks a configuration that names a provider.
+func (c Config) Validate(production bool) error {
+	if !c.Enabled() {
+		return nil
+	}
+	switch c.Provider {
+	case "orgware":
+	default:
+		return fmt.Errorf("APP_PAY_PROVIDER %q is not a known payment gateway (use orgware, or leave it empty)", c.Provider)
+	}
+	u, err := url.Parse(c.LinkURL)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && (production || u.Scheme != "http")) {
+		return errors.New("APP_PAY_LINK_URL must be an https URL")
+	}
+	if len(c.ReturnSecret) < 32 {
+		return errors.New("APP_PAY_RETURN_SECRET must be at least 32 characters (the gateway application's redir_... secret)")
+	}
+	if c.UnitMinor <= 0 || c.MinUnits < 1 || c.MaxUnits < c.MinUnits {
+		return errors.New("APP_PAY_UNIT_MINOR must be positive and APP_PAY_MIN_UNITS..APP_PAY_MAX_UNITS a valid range")
+	}
+	if len(c.Currency) != 3 {
+		return errors.New("APP_PAY_CURRENCY must be a 3-letter code")
+	}
+	if c.App == "" {
+		return errors.New("APP_PAY_APP is required")
+	}
+	return nil
+}
+
+// WithDefaults fills the unset tuning values.
+func (c Config) WithDefaults() Config {
+	if c.App == "" {
+		c.App = "app"
+	}
+	if c.Currency == "" {
+		c.Currency = "USD"
+	}
+	if c.MinUnits == 0 {
+		c.MinUnits = 1
+	}
+	if c.MaxUnits == 0 {
+		c.MaxUnits = 1000
+	}
+	if c.OrderLife == 0 {
+		c.OrderLife = 24 * time.Hour
+	}
+	if c.MaxAge == 0 {
+		c.MaxAge = 15 * time.Minute
+	}
+	return c
+}
+
+// NewGateway builds the configured provider; it returns nil when online payment is off.
+func NewGateway(c Config) (Gateway, error) {
+	c = c.WithDefaults()
+	if !c.Enabled() {
+		return nil, nil
+	}
+	if err := c.Validate(false); err != nil {
+		return nil, err
+	}
+	switch c.Provider {
+	case "orgware":
+		return &Orgware{cfg: c}, nil
+	}
+	return nil, fmt.Errorf("unknown payment gateway %q", c.Provider)
+}
+
+// buildLink fills a payment-link template.
+func buildLink(tmpl string, o LinkOrder, amount int64, currency, app string) (string, error) {
+	u, err := url.Parse(tmpl)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return "", errors.New("the payment link is not set up correctly")
+	}
+	if strings.ContainsAny(tmpl, "{}") {
+		r := strings.NewReplacer(
+			"{ref}", url.QueryEscape(o.Reference),
+			"{quantity}", strconv.FormatInt(o.Quantity, 10),
+			"{redirect}", url.QueryEscape(o.Redirect),
+			"{amount}", strconv.FormatInt(amount, 10),
+			"{currency}", url.QueryEscape(currency),
+		)
+		return r.Replace(tmpl), nil
+	}
+	q := u.Query()
+	q.Set("app", app)
+	q.Set("reference", o.Reference)
+	q.Set("quantity", strconv.FormatInt(o.Quantity, 10))
+	q.Set("success_url", o.Redirect)
+	q.Set("failure_url", o.Redirect)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}

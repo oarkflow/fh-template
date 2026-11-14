@@ -1,0 +1,227 @@
+package accounts
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	appauth "__FH_MODULE__/internal/auth"
+	"__FH_MODULE__/internal/modules/audit"
+	"__FH_MODULE__/internal/modules/settings"
+	"__FH_MODULE__/internal/modules/vault"
+	"github.com/oarkflow/squealx"
+	"github.com/oarkflow/squealx/drivers/sqlite"
+)
+
+const goodPassword = "Correct-Horse-9"
+
+type fixture struct {
+	svc *Service
+	db  *squealx.DB
+	ver *Verifier
+	mem *MemoryNotifier
+	now time.Time
+}
+
+func newFixture(t *testing.T, bcl string) *fixture {
+	t.Helper()
+	db, err := sqlite.Open("file:"+t.TempDir()+"/a.db?_pragma=busy_timeout(5000)", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	for _, f := range []string{"sql/0001_accounts.sql"} {
+		raw, _ := migrations.ReadFile(f)
+		for _, stmt := range strings.Split(string(raw), ";\n") {
+			if strings.TrimSpace(stmt) != "" {
+				if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE key_store (subject_id TEXT PRIMARY KEY, version TEXT NOT NULL, blob BLOB NOT NULL, created_at TEXT NOT NULL)`,
+		`CREATE TABLE audit_log (seq INTEGER PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, object TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '', prev_hash TEXT NOT NULL, hash TEXT NOT NULL)`,
+	} {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := settings.Parse([]byte(bcl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := &MemoryNotifier{}
+	svc := New(db, vault.New(vault.RandomMemoryKMS(), vault.DBKeyStore{DB: db}), audit.New(db), &cfg, mem, Params{Time: 1, Memory: 8, Threads: 1})
+	f := &fixture{svc: svc, db: db, mem: mem, now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	svc.Now = func() time.Time { return f.now }
+	src, err := buildSources(&cfg, svc, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.ver = NewVerifier(svc, src)
+	return f
+}
+
+func (f *fixture) login(user, pw, otp string) (appauth.Identity, error) {
+	return f.ver.VerifyContext(context.Background(), appauth.LoginInput{Username: user, Password: pw, OTP: otp})
+}
+
+const builtinBCL = `
+role "admin" { permissions ["*"] staff true }
+role "viewer" { permissions ["x:read"] }
+registration { enabled true default_role "viewer" }
+datasource "local" { kind "builtin" }
+auth { sources ["local"] lockout { max_failures 3 lock_minutes 10 } }`
+
+func TestRegisterVerifyLogin(t *testing.T) {
+	f := newFixture(t, builtinBCL)
+	ctx := context.Background()
+	id, code, err := f.svc.Register(ctx, "", Contact{Email: "ann@example.com"}, "Ann", goodPassword)
+	if err != nil || code == "" {
+		t.Fatalf("register: %v %q", err, code)
+	}
+	if _, err := f.login("ann@example.com", goodPassword, ""); err == nil {
+		t.Fatal("a pending account must not sign in")
+	}
+	if err := f.svc.VerifyOTP(ctx, id, "register", "000000"); err == nil {
+		t.Fatal("wrong code accepted")
+	}
+	if err := f.svc.VerifyOTP(ctx, id, "register", f.mem.LastCode()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.login("ANN@example.com", goodPassword, "")
+	if err != nil || got.ID != id || got.Roles[0] != "viewer" || got.Tenant != "default" {
+		t.Fatalf("login = %+v, %v", got, err)
+	}
+}
+
+func TestLockoutAfterRepeatedFailures(t *testing.T) {
+	f := newFixture(t, builtinBCL)
+	if _, err := f.svc.CreateAccount(context.Background(), "t", "", Contact{Email: "bo@example.com"}, "Bo", goodPassword, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		_, _ = f.login("bo@example.com", "wrong-Password-1", "")
+	}
+	if _, err := f.login("bo@example.com", goodPassword, ""); err == nil || !strings.Contains(err.Error(), "too many") {
+		t.Fatalf("expected lockout even with the right password, got %v", err)
+	}
+	f.now = f.now.Add(11 * time.Minute)
+	if _, err := f.login("bo@example.com", goodPassword, ""); err != nil {
+		t.Fatalf("lockout should have expired: %v", err)
+	}
+}
+
+func TestTOTPFlow(t *testing.T) {
+	f := newFixture(t, builtinBCL)
+	ctx := context.Background()
+	a, _ := f.svc.CreateAccount(ctx, "t", "", Contact{Email: "cy@example.com"}, "Cy", goodPassword, "admin")
+	secret, _, err := f.svc.BeginTOTP(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, _ := TOTPCode(secret, f.now)
+	if err := f.svc.ConfirmTOTP(ctx, a.ID, code); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.login("cy@example.com", goodPassword, ""); err == nil || !strings.Contains(err.Error(), "authenticator") {
+		t.Fatalf("missing code must ask for one, got %v", err)
+	}
+	if _, err := f.login("cy@example.com", goodPassword, code); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaticDatasourceAndOrder(t *testing.T) {
+	t.Setenv("TEST_ROOT_PW", "root-secret-pass")
+	f := newFixture(t, `
+role "admin" { permissions ["*"] }
+datasource "boot" { kind "static" user "root" { password_env "TEST_ROOT_PW" roles ["admin"] } }
+datasource "local" { kind "builtin" }
+auth { sources ["boot", "local"] }`)
+	got, err := f.login("root", "root-secret-pass", "")
+	if err != nil || got.Roles[0] != "admin" {
+		t.Fatalf("static login = %+v %v", got, err)
+	}
+	if _, err := f.login("root", "nope", ""); err == nil {
+		t.Fatal("bad static password accepted")
+	}
+}
+
+func TestSQLDatasourceWithBcrypt(t *testing.T) {
+	f := newFixture(t, `
+role "admin" { permissions ["*"] }
+role "staff" { permissions ["x:read"] }
+datasource "legacy" {
+  kind "sql"
+  hash "bcrypt"
+  lookup "SELECT uid, mail, pw, grp, active, org, nm FROM legacy_users WHERE mail = ?"
+  columns { id "uid" identifier "mail" password "pw" roles "grp" status "active" tenant "org" name "nm" }
+}
+auth { sources ["legacy"] }`)
+	hash, err := bcryptHash("legacy-pass-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, q := range []string{
+		`CREATE TABLE legacy_users (uid TEXT, mail TEXT, pw TEXT, grp TEXT, active TEXT, org TEXT, nm TEXT)`,
+		`INSERT INTO legacy_users VALUES ('u1','li@example.com','` + hash + `','staff, admin','1','default','Li')`,
+		`INSERT INTO legacy_users VALUES ('u2','off@example.com','` + hash + `','staff','0','default','Off')`,
+	} {
+		if _, err := f.db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := f.login("li@example.com", "legacy-pass-1", "")
+	if err != nil || got.ID != "u1" || len(got.Roles) != 2 || got.Name != "Li" {
+		t.Fatalf("login = %+v %v", got, err)
+	}
+	if _, err := f.login("off@example.com", "legacy-pass-1", ""); err == nil {
+		t.Fatal("inactive row signed in")
+	}
+}
+
+func TestMFARequiredRejectsUnenrolled(t *testing.T) {
+	f := newFixture(t, strings.Replace(builtinBCL, `lock_minutes 10 }`, `lock_minutes 10 } mfa { totp "required" }`, 1))
+	_, _ = f.svc.CreateAccount(context.Background(), "t", "", Contact{Email: "di@example.com"}, "Di", goodPassword, "admin")
+	if _, err := f.login("di@example.com", goodPassword, ""); err == nil {
+		t.Fatal("required MFA must reject an account with no authenticator")
+	}
+}
+
+func TestLastAdminProtected(t *testing.T) {
+	f := newFixture(t, builtinBCL)
+	ctx := context.Background()
+	a, _ := f.svc.CreateAccount(ctx, "t", "", Contact{Email: "ed@example.com"}, "Ed", goodPassword, "admin")
+	viewer := "viewer"
+	if err := f.svc.Update(ctx, "t", "default", a.ID, &viewer, nil); err == nil || !strings.Contains(err.Error(), "last active administrator") {
+		t.Fatalf("demoting the last admin must fail, got %v", err)
+	}
+	b, _ := f.svc.CreateAccount(ctx, "t", "", Contact{Email: "fay@example.com"}, "Fay", goodPassword, "admin")
+	if err := f.svc.Update(ctx, "t", "default", a.ID, &viewer, nil); err != nil {
+		t.Fatal(err)
+	}
+	disabled := "disabled"
+	if err := f.svc.Update(ctx, "t", "default", b.ID, nil, &disabled); err == nil {
+		t.Fatal("disabling the last admin must fail")
+	}
+}
+
+func TestMultiTenantIsolation(t *testing.T) {
+	f := newFixture(t, strings.Replace(builtinBCL, `registration`, `tenancy { mode "multi" } registration`, 1))
+	ctx := context.Background()
+	if _, err := f.svc.CreateAccount(ctx, "t", "acme", Contact{Email: "gi@example.com"}, "Gi", goodPassword, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ver.VerifyContext(ctx, appauth.LoginInput{Username: "gi@example.com", Password: goodPassword, Tenant: "globex"}); err == nil {
+		t.Fatal("an acme account signed in to globex")
+	}
+	got, err := f.ver.VerifyContext(ctx, appauth.LoginInput{Username: "gi@example.com", Password: goodPassword, Tenant: "acme"})
+	if err != nil || got.Tenant != "acme" {
+		t.Fatalf("acme login = %+v %v", got, err)
+	}
+}

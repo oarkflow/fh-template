@@ -1,0 +1,7 @@
+{
+  "name": "settings",
+  "description": "BCL-driven application settings (config/app.bcl): tenancy mode, roles and permissions, identity datasources, authentication policy and key-management backend.",
+  "requires": [],
+  "package": "internal/modules/settings",
+  "env": ["APP_CONFIG=config/app.bcl"]
+}

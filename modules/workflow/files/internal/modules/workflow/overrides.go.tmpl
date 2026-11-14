@@ -1,0 +1,304 @@
+package workflow
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/oarkflow/ref/pipeline"
+
+)
+
+const overrideTTL = 5 * time.Second
+
+type cachedOverride struct {
+	ov     *pipeline.Overrides
+	rev    int
+	loaded time.Time
+}
+
+type overrideCache struct {
+	mu sync.Mutex
+	m  map[string]cachedOverride
+}
+
+func ovKey(tenant, name string) string { return tenant + "\x00" + name }
+
+// current returns the tenant's overrides for a pipeline. The engine calls this
+// on every view and save, so it is served from memory and refreshed every few
+// seconds, which is also how another instance's edit arrives.
+func (s *Service) current(tenant, name string) *pipeline.Overrides {
+	s.ovc.mu.Lock()
+	defer s.ovc.mu.Unlock()
+	if s.ovc.m == nil {
+		s.ovc.m = map[string]cachedOverride{}
+	}
+	k := ovKey(tenant, name)
+	if c, ok := s.ovc.m[k]; ok && time.Since(c.loaded) < overrideTTL {
+		return c.ov
+	}
+	ov, rev, err := s.loadOverrides(context.Background(), tenant, name)
+	if err != nil {
+		if c, ok := s.ovc.m[k]; ok {
+			return c.ov // keep serving the last good copy on a transient error
+		}
+		return nil
+	}
+	s.ovc.m[k] = cachedOverride{ov: ov, rev: rev, loaded: time.Now()}
+	return ov
+}
+
+func (s *Service) forget(tenant, name string) {
+	s.ovc.mu.Lock()
+	delete(s.ovc.m, ovKey(tenant, name))
+	s.ovc.mu.Unlock()
+}
+
+func (s *Service) loadOverrides(ctx context.Context, tenant, name string) (*pipeline.Overrides, int, error) {
+	var row struct {
+		Rev  int    `db:"rev"`
+		Body string `db:"body"`
+	}
+	err := s.DB.GetContext(ctx, &row, `SELECT rev, body FROM workflow_overrides WHERE tenant_id=? AND pipeline=? ORDER BY rev DESC LIMIT 1`, tenant, name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	var ov pipeline.Overrides
+	if err := json.Unmarshal([]byte(row.Body), &ov); err != nil {
+		return nil, 0, err
+	}
+	return &ov, row.Rev, nil
+}
+
+// Overrides returns the tenant's current settings and their revision.
+func (s *Service) Overrides(ctx context.Context, tenant, name string) (*pipeline.Overrides, int, error) {
+	if _, ok := s.eng(name); !ok {
+		return nil, 0, Err(404, "PIPELINE_NOT_FOUND", "no such workflow")
+	}
+	ov, rev, err := s.loadOverrides(ctx, tenant, name)
+	if ov == nil {
+		ov = &pipeline.Overrides{}
+	}
+	return ov, rev, err
+}
+
+// CheckOverrides lists everything wrong with a proposed set of settings. Beyond
+// the engine's own checks it refuses what would weaken verification: hiding a
+// form that carries required fields, and hiding or disabling a form written by
+// the system (the liveness result), because a hidden form is never validated.
+func (s *Service) CheckOverrides(name string, ov *pipeline.Overrides) ([]string, error) {
+	e, ok := s.eng(name)
+	if !ok {
+		return nil, Err(404, "PIPELINE_NOT_FOUND", "no such workflow")
+	}
+	problems := e.C.CheckOverrides(ov)
+	if ov == nil {
+		return problems, nil
+	}
+	if len(ov.Fields) > 200 || len(ov.Stages) > 50 {
+		problems = append(problems, "too many settings")
+	}
+	for key, fo := range ov.Fields {
+		form, input, hasInput := strings.Cut(key, ".")
+		if utf8Len(fo.Label) > 120 || strings.IndexFunc(fo.Label, unicode.IsControl) >= 0 {
+			problems = append(problems, fmt.Sprintf("%q: the label must be plain text of at most 120 characters", key))
+		}
+		hide := fo.Hidden != nil && *fo.Hidden
+		off := fo.Disabled != nil && *fo.Disabled
+		if !hide && !off {
+			continue
+		}
+		info, ok := describeForm(e.C, form)
+		if !ok {
+			continue // the engine already reported the unknown form
+		}
+		switch {
+		case info.System:
+			problems = append(problems, fmt.Sprintf("%q is written by the system and cannot be hidden or disabled", key))
+		case !hasInput && hide && info.hasRequired():
+			problems = append(problems, fmt.Sprintf("form %q has required fields and cannot be hidden", form))
+		case hasInput && hide:
+			for _, in := range info.Inputs {
+				if in.Name == input && in.Required {
+					problems = append(problems, fmt.Sprintf("%q is required and cannot be hidden", key))
+				}
+			}
+		}
+	}
+	slices.Sort(problems)
+	return problems, nil
+}
+
+func utf8Len(s string) int { return len([]rune(s)) }
+
+// SetOverrides stores a new revision after validating it. An empty set clears the tenant's settings.
+func (s *Service) SetOverrides(ctx context.Context, actor, tenant, name string, ov *pipeline.Overrides, note string) (int, []string, error) {
+	problems, err := s.CheckOverrides(name, ov)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(problems) > 0 {
+		return 0, problems, Err(422, "INVALID_FORM_SETTINGS", "%s", problems[0])
+	}
+	if ov == nil {
+		ov = &pipeline.Overrides{}
+	}
+	body, _ := json.Marshal(ov)
+	var rev int
+	if err := s.DB.GetContext(ctx, &rev, `SELECT COALESCE(MAX(rev),0)+1 FROM workflow_overrides WHERE tenant_id=? AND pipeline=?`, tenant, name); err != nil {
+		return 0, nil, err
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO workflow_overrides (tenant_id, pipeline, rev, body, author, note, at) VALUES (?,?,?,?,?,?,?)`,
+		tenant, name, rev, string(body), actor, note, s.Stamp()); err != nil {
+		return 0, nil, err
+	}
+	s.forget(tenant, name)
+	_ = s.Audit.Append(ctx, actor, "workflow.set_form_settings", name, map[string]any{"tenant": tenant, "rev": rev, "fields": len(ov.Fields), "stages": len(ov.Stages)})
+	return rev, nil, nil
+}
+
+// OverrideRevision is one entry of the settings history.
+type OverrideRevision struct {
+	Rev    int    `db:"rev" json:"rev"`
+	Author string `db:"author" json:"author"`
+	Note   string `db:"note" json:"note"`
+	At     string `db:"at" json:"at"`
+}
+
+func (s *Service) OverrideHistory(ctx context.Context, tenant, name string) ([]OverrideRevision, error) {
+	var out []OverrideRevision
+	err := s.DB.SelectContext(ctx, &out, `SELECT rev, author, note, at FROM workflow_overrides WHERE tenant_id=? AND pipeline=? ORDER BY rev DESC LIMIT 100`, tenant, name)
+	return out, err
+}
+
+// RollbackOverrides makes an earlier revision current again (as a new revision).
+func (s *Service) RollbackOverrides(ctx context.Context, actor, tenant, name string, rev int) (int, error) {
+	var body string
+	if err := s.DB.GetContext(ctx, &body, `SELECT body FROM workflow_overrides WHERE tenant_id=? AND pipeline=? AND rev=?`, tenant, name, rev); err != nil {
+		return 0, Err(404, "REVISION_NOT_FOUND", "revision not found")
+	}
+	var ov pipeline.Overrides
+	if err := json.Unmarshal([]byte(body), &ov); err != nil {
+		return 0, err
+	}
+	// The workflow may have changed since; the old settings must still be valid.
+	newRev, _, err := s.SetOverrides(ctx, actor, tenant, name, &ov, fmt.Sprintf("rollback to %d", rev))
+	return newRev, err
+}
+
+// ---- description for the editor -------------------------------------------------
+
+// InputInfo and FormInfo describe the shape of a workflow for a settings editor.
+type InputInfo struct {
+	Name      string `json:"name"`
+	Label     string `json:"label"`
+	Kind      string `json:"kind"`
+	Required  bool   `json:"required"`
+	Sensitive bool   `json:"sensitive,omitempty"`
+}
+
+type FormInfo struct {
+	Name   string      `json:"name"`
+	Title  string      `json:"title"`
+	System bool        `json:"system,omitempty"` // written by a service; cannot be hidden or disabled
+	Inputs []InputInfo `json:"inputs"`
+}
+
+func (f FormInfo) hasRequired() bool {
+	return slices.ContainsFunc(f.Inputs, func(i InputInfo) bool { return i.Required })
+}
+
+type StageInfo struct {
+	Name     string `json:"name"`
+	Title    string `json:"title"`
+	HasSLA   bool   `json:"hasSla"`
+	Duration string `json:"duration,omitempty"`
+	Warn     string `json:"warnBefore,omitempty"`
+}
+
+// Description is what an administrator can tune for a workflow.
+type Description struct {
+	Name   string      `json:"name"`
+	Title  string      `json:"title"`
+	Forms  []FormInfo  `json:"forms"`
+	Stages []StageInfo `json:"stages"`
+}
+
+func describeForm(c *pipeline.Compiled, name string) (FormInfo, bool) {
+	var form *pipeline.Form
+	for i := range c.Def.Forms {
+		if c.Def.Forms[i].Name == name {
+			form = &c.Def.Forms[i]
+		}
+	}
+	for _, st := range c.Def.Stages {
+		for i := range st.Forms {
+			if st.Forms[i].Name == name {
+				form = &st.Forms[i]
+			}
+		}
+	}
+	if form == nil {
+		return FormInfo{}, false
+	}
+	out := FormInfo{Name: form.Name, Title: form.Title, System: slices.Contains(form.EditRoles, "system")}
+	if ins, ok := c.FormInputs(name); ok {
+		for _, in := range ins {
+			out.Inputs = append(out.Inputs, InputInfo{Name: in.Name, Label: in.Label, Kind: in.Kind, Required: in.Required, Sensitive: in.Sensitive})
+		}
+	}
+	return out, true
+}
+
+// Describe lists the forms, inputs and stage timings that can be tuned.
+func (s *Service) Describe(name string) (Description, error) {
+	e, ok := s.eng(name)
+	if !ok {
+		return Description{}, Err(404, "PIPELINE_NOT_FOUND", "no such workflow")
+	}
+	d := Description{Name: name, Title: e.C.Def.Title}
+	seen := map[string]bool{}
+	add := func(f pipeline.Form) {
+		if seen[f.Name] {
+			return
+		}
+		seen[f.Name] = true
+		if fi, ok := describeForm(e.C, f.Name); ok {
+			d.Forms = append(d.Forms, fi)
+		}
+	}
+	for _, f := range e.C.Def.Forms {
+		add(f)
+	}
+	for _, st := range e.C.Def.Stages {
+		for _, f := range st.Forms {
+			add(f)
+		}
+		si := StageInfo{Name: st.Name, Title: st.Title}
+		if st.SLA != nil {
+			si.HasSLA, si.Duration, si.Warn = true, st.SLA.Duration, st.SLA.WarnBefore
+		}
+		d.Stages = append(d.Stages, si)
+	}
+	return d, nil
+}
+
+// Pipelines lists the loaded workflows.
+func (s *Service) Pipelines() []string {
+	var out []string
+	for name := range s.allEngines() {
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out
+}

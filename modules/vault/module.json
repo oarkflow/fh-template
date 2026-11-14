@@ -1,0 +1,13 @@
+{
+  "name": "vault",
+  "description": "Field-level envelope encryption (per-subject DEKs, AAD-bound ciphertexts, blind indexes, crypto-shredding) with an env-key or secretr-backed KMS (vault.backend in config/app.bcl), plus an encrypted-blob object store.",
+  "requires": [
+    "settings"
+  ],
+  "package": "internal/modules/vault",
+  "env": [
+    "# vault module: 32 random bytes, base64url (openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\\n'). Empty is allowed only in development (ciphertexts then do not survive a restart).",
+    "APP_VAULT_KEY=",
+    "APP_OBJECTS_DIR=data/objects"
+  ]
+}

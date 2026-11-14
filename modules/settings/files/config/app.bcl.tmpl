@@ -1,0 +1,108 @@
+# Application settings. Everything here is read at startup; edit and restart.
+# Validate with:  bcl validate config/app.bcl
+
+# ── Tenancy ────────────────────────────────────────────────────────────────
+# single: one implicit tenant, nothing in the UI or API mentions tenants.
+# multi:  accounts, roles and data are isolated per tenant; login names a tenant.
+tenancy {
+  mode "single"
+  default "default"
+}
+
+# ── Roles ──────────────────────────────────────────────────────────────────
+# Permissions are "resource:action" strings. "*" grants everything; there are no partial wildcards. These are only the defaults:
+# with the rbac module they are seeded into the database and then editable in the
+# admin UI (per tenant when tenancy is multi).
+role "admin" {
+  title "Administrator"
+  description "Full access, including access control and audit."
+  permissions ["*"]
+  staff true
+}
+
+role "editor" {
+  title "Editor"
+  description "Can create and change content."
+  permissions ["notes:read", "notes:write"]
+  staff true
+}
+
+role "viewer" {
+  title "Viewer"
+  description "Read-only access."
+  permissions ["notes:read"]
+}
+
+# ── Self-registration ──────────────────────────────────────────────────────
+registration {
+  enabled false
+  default_role "viewer"
+  verify "email"        # email | phone | none
+}
+
+# ── Identity datasources ───────────────────────────────────────────────────
+# Where accounts and credentials live. auth.sources lists them in the order they
+# are tried at login. kind is one of:
+#   builtin  the accounts table managed by the accounts module (registration,
+#            OTP, TOTP, staff management all work on it)
+#   static   users listed right here; secrets come from environment variables
+#   sql      an existing user table you already have, read with your own query
+
+datasource "local" {
+  kind "builtin"
+}
+
+# Development convenience: the APP_LOGIN_USER / APP_LOGIN_PASSWORD account.
+datasource "bootstrap" {
+  kind "static"
+  user "admin" {
+    name "Administrator"
+    password_env "APP_LOGIN_PASSWORD"
+    roles ["admin"]
+  }
+}
+
+# Example of an external user table (uncomment and adjust):
+#
+# datasource "legacy" {
+#   kind "sql"
+#   driver "sqlite"                 # driver of the database below
+#   dsn_env "LEGACY_DATABASE_URL"   # empty: use the application database
+#   hash "bcrypt"                   # argon2id | bcrypt
+#   lookup "SELECT uid, email, pw_hash, role, active, totp, org, full_name FROM users WHERE email = ?"
+#   columns {
+#     id "uid"
+#     identifier "email"
+#     password "pw_hash"
+#     roles "role"                  # one role, or a comma separated list
+#     status "active"               # 'active', '1' and 'true' allow login
+#     totp "totp"
+#     tenant "org"
+#     name "full_name"
+#   }
+# }
+
+# ── Authentication ─────────────────────────────────────────────────────────
+auth {
+  sources ["bootstrap"]           # add "local" (accounts module) and others here
+  identifier "email"              # what people type: email | username | phone
+  min_password_length 12
+  otp_ttl_seconds 600
+  session_minutes 30
+
+  lockout {
+    max_failures 5
+    lock_minutes 15
+  }
+
+  mfa {
+    totp "optional"               # off | optional | required
+    issuer "My App"
+  }
+}
+
+# ── Key management (vault module) ──────────────────────────────────────────
+vault {
+  backend "env"                   # env: APP_VAULT_KEY | secretr: encrypted key store under dir
+  dir "data/kms"                  # secretr only
+}

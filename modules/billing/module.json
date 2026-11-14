@@ -1,0 +1,22 @@
+{
+  "name": "billing",
+  "description": "Prepaid usage billing: per-customer ledger with idempotent charges and refunds, rate cards, volume discounts, meters, monthly invoices, CSV statements, low-balance alerts and optional online top-ups through a signed-return payment gateway.",
+  "requires": ["settings", "audit"],
+  "package": "internal/modules/billing/mod",
+  "env": [
+    "# billing module: online top-ups are off while APP_PAY_PROVIDER is empty (administrators can still record payments)",
+    "APP_BILLING_CURRENCIES=USD",
+    "APP_BILLING_TAX_BPS=0",
+    "APP_BILLING_SELLER_NAME=",
+    "APP_BILLING_SELLER_TAX_ID=",
+    "APP_PAY_PROVIDER=",
+    "APP_PAY_LINK_URL=",
+    "APP_PAY_RETURN_URL=http://localhost:8080/pay/return",
+    "APP_PAY_RETURN_SECRET=",
+    "APP_PAY_APP=",
+    "APP_PAY_CURRENCY=USD",
+    "APP_PAY_UNIT_MINOR=0",
+    "APP_PAY_MIN_UNITS=1",
+    "APP_PAY_MAX_UNITS=1000"
+  ]
+}

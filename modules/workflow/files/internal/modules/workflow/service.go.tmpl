@@ -1,0 +1,751 @@
+package workflow
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/oarkflow/ref/pipeline"
+
+	"__FH_MODULE__/internal/modules"
+)
+
+const table = "workflow_cases"
+
+var (
+	// ErrNoChange is returned by a Mutate callback that decided nothing needs
+	// saving; Mutate then returns the case as loaded, without a new revision.
+	ErrNoChange = errors.New("workflow: nothing to change")
+	ErrNotFound = errors.New("workflow: case not found")
+	ErrConflict = errors.New("workflow: case changed, reload and retry")
+)
+
+// Service stores workflow cases and runs the pipeline engines on them.
+type Service struct {
+	Deps
+	// ApplicantRole is the role the person who opened a case acts under (the
+	// roles of the public stages in the BCL pipeline).
+	ApplicantRole string
+	// Carry lists, per pipeline, the forms a restarted case starts with from the
+	// previous one. System-written forms should not be listed.
+	Carry map[string][]string
+	// Retention says how long a finished case is kept before it is anonymised or
+	// purged, per pipeline and outcome ("approved", "rejected", "withdrawn").
+	// nil means the pipeline definition's own rule applies.
+	Retention func(ctx context.Context, tenant, pipeline, outcome string) (Rule, bool)
+	engMu      sync.RWMutex
+	engines    map[string]*pipeline.Engine
+	set        *Set
+	signingKey []byte
+	automation pipeline.Automation
+	ovc        overrideCache
+	// Approved runs once when a case completes (issue the credential).
+	// Ended runs when a case is rejected or withdrawn after having been approved,
+	// or is rejected (revoke / do not issue). Both may be nil.
+	Approved func(ctx context.Context, subjectID string, c *pipeline.Case) error
+	Ended    func(ctx context.Context, subjectID string, c *pipeline.Case) error
+	// Directory lists the people routing may assign work to; Workload says how
+	// much each already holds. Both come from the host (staff accounts).
+	Directory func(ctx context.Context) []pipeline.Worker
+	// InTenant says whether a person belongs to a tenant; notifications reach only
+	// people of the tenant a case belongs to.
+	InTenant func(ctx context.Context, user, tenant string) bool
+	// Hooks are the host functions workflow `on` blocks can run, by name.
+	Hooks map[string]Hook
+}
+
+// New builds a service over compiled pipelines. signingKey signs certificates.
+func New(d Deps, set *Set, signingKey []byte) *Service {
+	s := &Service{Deps: d, signingKey: signingKey, ApplicantRole: "applicant"}
+	s.install(set)
+	return s
+}
+
+// buildEngine makes the engine for one compiled pipeline, with everything the host provides.
+func (s *Service) buildEngine(name string, c *pipeline.Compiled, lookups Lookups) *pipeline.Engine {
+	e := NewEngine(c, s.signingKey, lookups)
+	e.Now = s.Deps.Now
+	e.Automation = s.automation
+	e.Overrides = func(c *pipeline.Case) *pipeline.Overrides { return s.current(c.TenantID, name) }
+	e.Directory = func(ctx context.Context) []pipeline.Worker {
+		if s.Directory == nil {
+			return nil
+		}
+		return s.Directory(ctx)
+	}
+	e.Workload = s.workload
+	return e
+}
+
+// install makes a set of definitions the running ones, replacing every engine at
+// once. Requests already in flight finish on the engine they started with.
+func (s *Service) install(set *Set) {
+	engines := make(map[string]*pipeline.Engine, len(set.Pipelines))
+	for name, c := range set.Pipelines {
+		engines[name] = s.buildEngine(name, c, set.Lookups)
+	}
+	s.engMu.Lock()
+	s.engines, s.set = engines, set
+	s.engMu.Unlock()
+}
+
+// eng returns the running engine of a pipeline.
+func (s *Service) eng(name string) (*pipeline.Engine, bool) {
+	s.engMu.RLock()
+	defer s.engMu.RUnlock()
+	e, ok := s.engines[name]
+	return e, ok
+}
+
+// allEngines returns a copy of the running engines.
+func (s *Service) allEngines() map[string]*pipeline.Engine {
+	s.engMu.RLock()
+	defer s.engMu.RUnlock()
+	out := make(map[string]*pipeline.Engine, len(s.engines))
+	for k, v := range s.engines {
+		out[k] = v
+	}
+	return out
+}
+
+// SetAutomation installs the host's automated-node implementation on every
+// pipeline (the providers behind `kind automated` nodes), including any
+// definition published later.
+func (s *Service) SetAutomation(a pipeline.Automation) {
+	s.automation = a
+	for _, e := range s.allEngines() {
+		e.Automation = a
+	}
+}
+
+// triage reads the plain facts a queue needs from a case: where the automatic
+// checks routed it, its bucket and priority, and whether its open step is overdue.
+func triage(c *pipeline.Case) (route, bucket string, priority int, breached bool) {
+	str := func(path string) string { v, _ := c.Get(path); s, _ := v.(string); return s }
+	priority = 5
+	if v, ok := c.Get("assessment.priority"); ok {
+		switch n := v.(type) {
+		case int:
+			priority = n
+		case int64:
+			priority = int(n)
+		case float64:
+			priority = int(n)
+		}
+	}
+	for _, v := range c.Timeline {
+		if v.LeftAt == nil && v.Breached {
+			breached = true
+		}
+	}
+	return str("assessment.route"), str("assessment.bucket"), priority, breached
+}
+
+// Names lists the workflows this service runs, sorted.
+func (s *Service) Names() []string {
+	engines := s.allEngines()
+	out := make([]string, 0, len(engines))
+	for n := range engines {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Engine returns the engine for a pipeline.
+func (s *Service) Engine(name string) (*pipeline.Engine, bool) {
+	return s.eng(name)
+}
+
+// ActorFor maps an account to a pipeline actor. roles are the account's
+// effective roles (base, granted and inherited); they share names with the
+// stage `roles` lists in the BCL files.
+func ActorFor(accountID string, roles []string) pipeline.Actor {
+	return pipeline.Actor{ID: accountID, Roles: roles}
+}
+
+// System is the actor used by services that write to a case (liveness, OCR).
+var System = pipeline.Actor{ID: "system", Roles: []string{"system"}}
+
+// Start opens a case for a subject. A subject has at most one open case per pipeline.
+func (s *Service) Start(ctx context.Context, name, tenant, subjectID string) (*pipeline.Case, error) {
+	return s.start(ctx, name, tenant, subjectID, nil)
+}
+
+// Current returns the subject's newest case of a pipeline, whatever its state,
+// or opens the first one. It never starts a second case after one has finished:
+// that is Restart, which the person asks for.
+func (s *Service) Current(ctx context.Context, name, tenant, subjectID string) (*pipeline.Case, error) {
+	return s.CurrentWith(ctx, name, tenant, subjectID, nil)
+}
+
+// CurrentWith is Current, opening the first case with the given starting data
+// (for example the legal name a business already gave when it applied).
+func (s *Service) CurrentWith(ctx context.Context, name, tenant, subjectID string, seed map[string]any) (*pipeline.Case, error) {
+	c, err := s.ForSubject(ctx, name, subjectID)
+	if errors.Is(err, ErrNotFound) {
+		return s.start(ctx, name, tenant, subjectID, seed)
+	}
+	return c, err
+}
+
+
+// Restart opens a new case for a subject whose last one has finished, starting
+// from what they already entered (see Carry).
+func (s *Service) Restart(ctx context.Context, name, tenant, subjectID string) (*pipeline.Case, error) {
+	return s.RestartWith(ctx, name, tenant, subjectID, nil)
+}
+
+// RestartWith opens a new case after the last one finished, carrying over what
+// the person entered and adding the given forms.
+func (s *Service) RestartWith(ctx context.Context, name, tenant, subjectID string, extra map[string]any) (*pipeline.Case, error) {
+	last, err := s.ForSubject(ctx, name, subjectID)
+	if err != nil {
+		return nil, err
+	}
+	switch last.Status {
+	case pipeline.CaseCompleted, pipeline.CaseApproved, pipeline.CaseRejected, pipeline.CaseWithdrawn:
+	default:
+		return nil, Err(409, "CASE_OPEN", "your application is still in progress")
+	}
+	data := map[string]any{}
+	for _, f := range s.Carry[name] {
+		if v, ok := last.Data[f]; ok {
+			data[f] = v
+		}
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	return s.start(ctx, name, tenant, subjectID, data)
+}
+
+func (s *Service) start(ctx context.Context, name, tenant, subjectID string, data map[string]any) (*pipeline.Case, error) {
+	e, ok := s.eng(name)
+	if !ok {
+		return nil, fmt.Errorf("workflow: unknown pipeline %q", name)
+	}
+	if open, err := s.openCase(ctx, name, subjectID); err != nil {
+		return nil, err
+	} else if open != "" {
+		return s.Get(ctx, open)
+	}
+	seq, err := s.nextSeq(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	actor := pipeline.Actor{ID: subjectID, Roles: []string{s.ApplicantRole}}
+	// The case belongs to its tenant's organisation unit: routing with
+	// same_org_unit only ever offers it to that tenant's staff.
+	c, err := e.Start(ctx, actor, pipeline.StartOptions{
+		ID: modules.NewID(), Number: pipeline.FormatNumber(e.C.Def.NumberFormat, seq, s.Time()), TenantID: tenant, OrgUnit: tenant, Data: data,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.insert(ctx, subjectID, c); err != nil {
+		return nil, err
+	}
+	s.dispatch(ctx, e, c)
+	return c, nil
+}
+
+func (s *Service) openCase(ctx context.Context, name, subjectID string) (string, error) {
+	var id string
+	err := s.DB.GetContext(ctx, &id, `SELECT id FROM workflow_cases WHERE subject_id=? AND pipeline=? AND status IN ('draft','in_progress','returned','suspended') LIMIT 1`, subjectID, name)
+	if err != nil {
+		if isNoRows(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return id, nil
+}
+
+func (s *Service) nextSeq(ctx context.Context, name string) (int64, error) {
+	var n int64
+	err := s.DB.GetContext(ctx, &n, `INSERT INTO workflow_sequences (pipeline, last) VALUES (?, 1)
+		ON CONFLICT(pipeline) DO UPDATE SET last = last + 1 RETURNING last`, name)
+	return n, err
+}
+
+type row struct {
+	ID        string `db:"id"`
+	TenantID  string `db:"tenant_id"`
+	Pipeline  string `db:"pipeline"`
+	SubjectID string `db:"subject_id"`
+	Revision  int64  `db:"revision"`
+	Body      string `db:"body_enc"`
+}
+
+func (s *Service) insert(ctx context.Context, subjectID string, c *pipeline.Case) error {
+	c.Revision = 1
+	body, err := s.seal(subjectID, c)
+	if err != nil {
+		return err
+	}
+	route, bucket, priority, breached := triage(c)
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO workflow_cases (id, tenant_id, pipeline, subject_id, number, stage, status, assignee, revision, body_enc, created_at, updated_at, route, bucket, priority, breached)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, c.ID, c.TenantID, c.Pipeline, subjectID, c.Number, c.Stage, c.Status, c.CurrentAssignee(), c.Revision, body, s.Stamp(), s.Stamp(), route, bucket, priority, boolInt(breached))
+	return err
+}
+
+func (s *Service) seal(subjectID string, c *pipeline.Case) (string, error) {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	return s.Vault.Encrypt(subjectID, table, "body_enc", c.ID, raw)
+}
+
+func (s *Service) open(r row) (*pipeline.Case, error) {
+	raw, err := s.Vault.Decrypt(r.SubjectID, table, "body_enc", r.ID, r.Body)
+	if err != nil {
+		return nil, err
+	}
+	var c pipeline.Case
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil, err
+	}
+	c.Revision = r.Revision
+	// The tenant column is the one queues and tenant checks rely on; the copy
+	// inside the sealed document must never disagree with it.
+	c.TenantID = r.TenantID
+	return &c, nil
+}
+
+// Get loads a case.
+func (s *Service) Get(ctx context.Context, id string) (*pipeline.Case, error) {
+	r, err := s.row(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.open(r)
+}
+
+func (s *Service) row(ctx context.Context, id string) (row, error) {
+	var r row
+	err := s.DB.GetContext(ctx, &r, `SELECT id, tenant_id, pipeline, subject_id, revision, body_enc FROM workflow_cases WHERE id=?`, id)
+	if isNoRows(err) {
+		return r, ErrNotFound
+	}
+	return r, err
+}
+
+// ForSubject returns the subject's newest case of a pipeline.
+func (s *Service) ForSubject(ctx context.Context, name, subjectID string) (*pipeline.Case, error) {
+	var id string
+	err := s.DB.GetContext(ctx, &id, `SELECT id FROM workflow_cases WHERE subject_id=? AND pipeline=? ORDER BY created_at DESC, rowid DESC LIMIT 1`, subjectID, name)
+	if isNoRows(err) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.Get(ctx, id)
+}
+
+// Mutate loads a case, applies fn through its engine and saves the result.
+// The save fails with ErrConflict when someone else changed the case first.
+func (s *Service) Mutate(ctx context.Context, id string, fn func(*pipeline.Engine, *pipeline.Case) (*pipeline.Case, error)) (*pipeline.Case, error) {
+	r, err := s.row(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	e, ok := s.eng(r.Pipeline)
+	if !ok {
+		return nil, fmt.Errorf("workflow: pipeline %q is no longer defined", r.Pipeline)
+	}
+	c, err := s.open(r)
+	if err != nil {
+		return nil, err
+	}
+	prev := c.Status
+	out, err := fn(e, c)
+	if errors.Is(err, ErrNoChange) {
+		return c, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out.Revision = r.Revision + 1
+	body, err := s.seal(r.SubjectID, out)
+	if err != nil {
+		return nil, err
+	}
+	route, bucket, priority, breached := triage(out)
+	res, err := s.DB.ExecContext(ctx, `UPDATE workflow_cases SET stage=?, status=?, assignee=?, revision=?, body_enc=?, updated_at=?, route=?, bucket=?, priority=?, breached=?, held=? WHERE id=? AND revision=?`,
+		out.Stage, out.Status, out.CurrentAssignee(), out.Revision, body, s.Stamp(), route, bucket, priority, boolInt(breached), boolInt(out.Hold != nil), id, r.Revision)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrConflict
+	}
+	s.dispatch(ctx, e, out)
+	if err := s.fire(ctx, r.SubjectID, prev, out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// Item is a queue row (no personal data).
+type Item struct {
+	ID        string `db:"id" json:"id"`
+	Number    string `db:"number" json:"number"`
+	Pipeline  string `db:"pipeline" json:"pipeline"`
+	Stage     string `db:"stage" json:"stage"`
+	Status    string `db:"status" json:"status"`
+	Assignee  string `db:"assignee" json:"assignee,omitempty"`
+	Route     string `db:"route" json:"route,omitempty"`
+	Bucket    string `db:"bucket" json:"bucket,omitempty"`
+	Priority  int    `db:"priority" json:"priority"`
+	Breached  bool   `db:"breached" json:"breached,omitempty"`
+	CreatedAt string `db:"created_at" json:"created_at"`
+	UpdatedAt string `db:"updated_at" json:"updated_at"`
+}
+
+// Queue lists a tenant's cases at the given stages, oldest first. Callers
+// pass only the stages the actor may work (Engine.CanAct).
+func (s *Service) Queue(ctx context.Context, name, tenant string, stages []string, statuses []string, limit int) ([]Item, error) {
+	if len(stages) == 0 {
+		return []Item{}, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	q := `SELECT id, number, pipeline, stage, status, assignee, route, bucket, priority, breached, created_at, updated_at FROM workflow_cases WHERE tenant_id=? AND pipeline=? AND stage IN (` + placeholders(len(stages)) + `)`
+	args := []any{tenant, name}
+	for _, st := range stages {
+		args = append(args, st)
+	}
+	if len(statuses) > 0 {
+		q += ` AND status IN (` + placeholders(len(statuses)) + `)`
+		for _, st := range statuses {
+			args = append(args, st)
+		}
+	}
+	q += ` ORDER BY priority, created_at LIMIT ?`
+	args = append(args, limit)
+	out := []Item{}
+	err := s.DB.SelectContext(ctx, &out, q, args...)
+	return out, err
+}
+
+// Erase destroys a subject's case documents by shredding their key; callers
+// do this through the existing erasure flow (vault.Shred) and then call Forget.
+func (s *Service) Forget(ctx context.Context, subjectID string) error {
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM workflow_cases WHERE subject_id=?`, subjectID)
+	return err
+}
+
+// fire runs the completion hooks when a mutation moved the case into a final status.
+func (s *Service) fire(ctx context.Context, subjectID, prev string, c *pipeline.Case) error {
+	if c.Status == prev {
+		return nil
+	}
+	switch c.Status {
+	case pipeline.CaseCompleted, pipeline.CaseApproved:
+		if s.Approved != nil {
+			return s.Approved(ctx, subjectID, c)
+		}
+	case pipeline.CaseRejected:
+		if s.Ended != nil {
+			return s.Ended(ctx, subjectID, c)
+		}
+	}
+	return nil
+}
+
+// Record writes values into one form of the subject's open case as the system
+// actor. It is how services (liveness, OCR) put their results where reviewers
+// see them. With no open case it does nothing: the result stays with the service
+// and the next case picks it up.
+func (s *Service) Record(ctx context.Context, name, subjectID, form string, values map[string]any) error {
+	id, err := s.openCase(ctx, name, subjectID)
+	if err != nil || id == "" {
+		return err
+	}
+	_, err = s.Mutate(ctx, id, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+		return e.Save(ctx, c, System, c.Stage, map[string]any{form: values})
+	})
+	return err
+}
+
+// Sweep scopes.
+const (
+	SweepOpen     = "open"     // SLA timers, warnings, breaches, escalation, holds that end
+	SweepFinished = "finished" // retention of completed, rejected or withdrawn cases
+)
+
+// SweepAll applies the engine's time-based rules to cases and returns how many
+// changed. A case is saved only when something happened, so a quiet sweep
+// writes nothing. A case the retention rule says to purge is deleted.
+func (s *Service) SweepAll(ctx context.Context, scope string) (int, error) {
+	q := `SELECT id FROM workflow_cases WHERE status IN ('in_progress','returned')`
+	if scope == SweepFinished {
+		q = `SELECT id FROM workflow_cases WHERE status IN ('completed','approved','rejected','withdrawn')`
+	}
+	var ids []string
+	if err := s.DB.SelectContext(ctx, &ids, q); err != nil {
+		return 0, err
+	}
+	changed := 0
+	for _, id := range ids {
+		purge := false
+		_, err := s.Mutate(ctx, id, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+			if scope == SweepFinished {
+				// The tenant's retention policy for this kind of case and this outcome
+				// comes first; the workflow definition's own rule is the fallback.
+				out, done, doPurge, err := s.retainByPolicy(ctx, e, c)
+				if err != nil {
+					return nil, err
+				}
+				if doPurge {
+					purge = true
+					return nil, ErrNoChange
+				}
+				if done {
+					changed++
+					return out, nil
+				}
+			}
+			out, res, err := e.Sweep(ctx, c)
+			if err != nil {
+				return nil, err
+			}
+			if res.Purge {
+				purge = true
+				return nil, ErrNoChange
+			}
+			if !res.Changed {
+				return nil, ErrNoChange
+			}
+			changed++
+			return out, nil
+		})
+		if purge {
+			if _, derr := s.DB.ExecContext(ctx, `DELETE FROM workflow_cases WHERE id=?`, id); derr == nil {
+				changed++
+			}
+			continue
+		}
+		if err != nil && !errors.Is(err, ErrConflict) {
+			return changed, err // a conflict just means someone else touched it; the next sweep sees it
+		}
+	}
+	return changed, nil
+}
+
+// outcomeOf names how a finished case ended, in the words retention rules use.
+func outcomeOf(status string) string {
+	switch status {
+	case pipeline.CaseCompleted, pipeline.CaseApproved:
+		return "approved"
+	case pipeline.CaseRejected:
+		return "rejected"
+	case pipeline.CaseWithdrawn:
+		return "withdrawn"
+	}
+	return ""
+}
+
+// retainByPolicy applies the tenant's retention rule for this kind of case and
+// this outcome. It reports whether the case was anonymised (out is then the case
+// to save) or must be deleted. A case under legal hold, already erased, still
+// open, or with no rule in the policy is left to the definition's own rule.
+func (s *Service) retainByPolicy(ctx context.Context, e *pipeline.Engine, c *pipeline.Case) (out *pipeline.Case, anonymised, purge bool, err error) {
+	if c.ClosedAt == nil || c.Hold != nil || c.Erased != nil {
+		return nil, false, false, nil
+	}
+	if s.Retention == nil {
+		return nil, false, false, nil
+	}
+	rule, ok := s.Retention(ctx, c.TenantID, c.Pipeline, outcomeOf(c.Status))
+	if !ok {
+		return nil, false, false, nil
+	}
+	if s.Time().Before(c.ClosedAt.AddDate(0, 0, rule.Days)) {
+		return nil, false, false, nil
+	}
+	if rule.Action == "purge" {
+		return nil, false, true, nil
+	}
+	out, err = e.Anonymize(ctx, c, System, fmt.Sprintf("retention: %d days after a %s %s case", rule.Days, c.Pipeline, outcomeOf(c.Status)))
+	if err != nil {
+		return nil, false, false, err
+	}
+	return out, true, false, nil
+}
+
+// workload counts what each person holds across open cases of a workflow, for
+// capacity and least-loaded routing.
+func (s *Service) workload(ctx context.Context, name string) (map[string]pipeline.Load, error) {
+	var rows []struct {
+		Assignee string `db:"assignee"`
+		Open     int    `db:"n"`
+		Last     string `db:"last"`
+	}
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT assignee, COUNT(*) AS n, MAX(updated_at) AS last FROM workflow_cases WHERE pipeline=? AND assignee<>'' AND status IN ('in_progress','returned') GROUP BY assignee`, name); err != nil {
+		return nil, err
+	}
+	out := map[string]pipeline.Load{}
+	for _, r := range rows {
+		t, _ := time.Parse(time.RFC3339, r.Last)
+		out[r.Assignee] = pipeline.Load{Open: r.Open, LastAssigned: t}
+	}
+	return out, nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// RerunChecks runs the automated nodes again for cases waiting at a step whose
+// checks have not passed (typically "held": screening was not set up, a
+// provider was down). A case that is still undecided is left as it was; one
+// that now passes moves on by itself.
+func (s *Service) RerunChecks(ctx context.Context) (int, error) {
+	var rows []struct {
+		ID    string `db:"id"`
+		Stage string `db:"stage"`
+	}
+	if err := s.DB.SelectContext(ctx, &rows, `SELECT id, stage FROM workflow_cases WHERE status IN ('in_progress','returned') AND route='held'`); err != nil {
+		return 0, err
+	}
+	moved := 0
+	for _, r := range rows {
+		_, err := s.Mutate(ctx, r.ID, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+			st, ok := e.C.Stage(c.Stage)
+			if !ok {
+				return nil, ErrNoChange
+			}
+			stage, before := c.Stage, c.Data
+			cur := c
+			for _, n := range st.Nodes {
+				if n.Kind != pipeline.NodeAutomated || cur.Stage != stage {
+					continue
+				}
+				out, err := e.NodeAct(ctx, cur, System, stage, n.Name, "run", pipeline.NodeInput{})
+				if err != nil {
+					return nil, err
+				}
+				cur = out
+			}
+			if cur.Stage == stage && fmt.Sprint(cur.Data["assessment"]) == fmt.Sprint(before["assessment"]) {
+				return nil, ErrNoChange // still undecided, nothing new to record
+			}
+			if cur.Stage != stage {
+				moved++
+			}
+			return cur, nil
+		})
+		if err != nil && !errors.Is(err, ErrConflict) {
+			return moved, err
+		}
+	}
+	return moved, nil
+}
+
+// Metrics summarises a tenant's cases for a work-queue dashboard. It reads only
+// the plain columns, never the sealed case documents.
+type Metrics struct {
+	Open            int            `json:"open"`
+	ByStage         map[string]int `json:"byStage"`
+	Breached        int            `json:"breached"`
+	OldestOpenHours float64        `json:"oldestOpenHours"`
+	Held            int            `json:"held"`
+	Decided7d       int            `json:"decided7d"`
+	Approved7d      int            `json:"approved7d"`
+	Auto7d          int            `json:"auto7d"`
+	Rejected7d      int            `json:"rejected7d"`
+}
+
+func (s *Service) Metrics(ctx context.Context, name, tenant string) (Metrics, error) {
+	m := Metrics{ByStage: map[string]int{}}
+	var open []struct {
+		Stage     string `db:"stage"`
+		Route     string `db:"route"`
+		Breached  int    `db:"breached"`
+		CreatedAt string `db:"created_at"`
+	}
+	if err := s.DB.SelectContext(ctx, &open, `SELECT stage, route, breached, created_at FROM workflow_cases WHERE tenant_id=? AND pipeline=? AND status IN ('in_progress','returned')`, tenant, name); err != nil {
+		return m, err
+	}
+	now := s.Time()
+	for _, o := range open {
+		m.Open++
+		m.ByStage[o.Stage]++
+		m.Breached += o.Breached
+		if o.Route == "held" {
+			m.Held++
+		}
+		if t, err := time.Parse(time.RFC3339, o.CreatedAt); err == nil {
+			if h := now.Sub(t).Hours(); h > m.OldestOpenHours {
+				m.OldestOpenHours = h
+			}
+		}
+	}
+	since := now.AddDate(0, 0, -7).UTC().Format(time.RFC3339)
+	var done []struct {
+		Status string `db:"status"`
+		Route  string `db:"route"`
+	}
+	if err := s.DB.SelectContext(ctx, &done, `SELECT status, route FROM workflow_cases WHERE tenant_id=? AND pipeline=? AND status IN ('completed','approved','rejected') AND updated_at >= ?`, tenant, name, since); err != nil {
+		return m, err
+	}
+	for _, d := range done {
+		m.Decided7d++
+		if d.Status == pipeline.CaseRejected {
+			m.Rejected7d++
+			continue
+		}
+		m.Approved7d++
+		if d.Route == "auto" {
+			m.Auto7d++
+		}
+	}
+	return m, nil
+}
+
+// SetLegalHold places or lifts a legal hold on a case. A held case cannot be
+// erased and is skipped by retention until the hold is released.
+func (s *Service) SetLegalHold(ctx context.Context, caseID string, actor pipeline.Actor, hold bool, reason string) (*pipeline.Case, error) {
+	return s.Mutate(ctx, caseID, func(e *pipeline.Engine, c *pipeline.Case) (*pipeline.Case, error) {
+		if hold {
+			return e.PlaceHold(ctx, c, actor, reason)
+		}
+		return e.ReleaseHold(ctx, c, actor, reason)
+	})
+}
+
+// internalForms are written by the automatic checks and describe how the system
+// judged an application. A person never sees them: a risk score or a sanctions
+// outcome shown to the applicant would tell them how to game the checks, or
+// that they are on a list.
+var internalForms = map[string]bool{"checks": true, "assessment": true}
+
+// PublicData is the case data a person may be given back (their own export):
+// everything they entered, without the system's judgement of it.
+func PublicData(c *pipeline.Case) map[string]any {
+	out := map[string]any{}
+	for k, v := range c.Data {
+		if !internalForms[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// Rule is a retention rule for finished cases.
+type Rule struct {
+	Days   int
+	Action string // "anonymize" or "purge"
+}
