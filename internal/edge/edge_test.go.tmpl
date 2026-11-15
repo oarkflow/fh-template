@@ -1,0 +1,93 @@
+package edge
+
+import (
+	"io"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/oarkflow/fh"
+)
+
+func TestParseCIDRs(t *testing.T) {
+	got, err := ParseCIDRs("10.0.0.0/8, 192.0.2.7 ,2001:db8::/32,")
+	if err != nil || len(got) != 3 {
+		t.Fatalf("got %v err %v", got, err)
+	}
+	if !got[1].Contains([]byte{192, 0, 2, 7}) {
+		t.Fatal("bare IP should become a /32")
+	}
+	for _, bad := range []string{"nope", "10.0.0.0/99", "300.1.1.1"} {
+		if _, err := ParseCIDRs(bad); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
+	}
+}
+
+// run serves one request through the middleware chain on a fresh app (App.Test
+// serves a single connection per call). The peer in tests is a net.Pipe, so
+// the socket address is not a real IP; the tests below therefore exercise the
+// middleware through a stub that sets the socket peer first.
+func run(t *testing.T, peer string, chain []fh.HandlerFunc, hdr map[string]string) (int, string) {
+	t.Helper()
+	app := fh.New()
+	app.Use(func(c fh.Ctx) error { fh.SetClientIP(c, peer); return c.Next() })
+	app.Use(chain...)
+	app.Get("/ip", func(c fh.Ctx) error { return c.SendString(c.IP()) })
+	req := httptest.NewRequest("GET", "http://localhost/ip", nil)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, string(b)
+}
+
+func TestRealIPOnlyTrustedPeers(t *testing.T) {
+	proxies, _ := ParseCIDRs("10.0.0.0/8")
+	chain := []fh.HandlerFunc{RealIP(proxies)}
+	if code, ip := run(t, "10.1.2.3", chain, map[string]string{"X-Forwarded-For": "203.0.113.9"}); code != 200 || ip != "203.0.113.9" {
+		t.Fatalf("trusted proxy: %d %s", code, ip)
+	}
+	// A client-forged leftmost hop is ignored: the right-most untrusted hop wins.
+	if _, ip := run(t, "10.1.2.3", chain, map[string]string{"X-Forwarded-For": "6.6.6.6, 203.0.113.9"}); ip != "203.0.113.9" {
+		t.Fatalf("spoofed chain not ignored: %s", ip)
+	}
+	// An untrusted peer cannot assert an address.
+	if _, ip := run(t, "198.51.100.5", chain, map[string]string{"X-Forwarded-For": "203.0.113.9"}); ip != "198.51.100.5" {
+		t.Fatalf("untrusted peer spoofed its IP: %s", ip)
+	}
+	// No trusted proxies configured: headers are never believed.
+	if _, ip := run(t, "10.1.2.3", []fh.HandlerFunc{RealIP(nil)}, map[string]string{"X-Forwarded-For": "203.0.113.9"}); ip != "10.1.2.3" {
+		t.Fatalf("empty trust list must ignore headers: %s", ip)
+	}
+}
+
+func TestOriginLockAndDenyList(t *testing.T) {
+	proxies, _ := ParseCIDRs("10.0.0.0/8")
+	deny, _ := ParseCIDRs("203.0.113.0/24")
+	chain := []fh.HandlerFunc{OriginLock(proxies), RealIP(proxies), DenyList(deny)}
+	if code, _ := run(t, "198.51.100.5", chain, nil); code != 403 {
+		t.Fatalf("direct non-proxy peer must be refused: %d", code)
+	}
+	// Loopback may probe /healthz only (container healthcheck), nothing else.
+	for path, want := range map[string]int{"/healthz": 200, "/api/x": 403} {
+		app := fh.New() // App.Test serves one connection per app
+		app.Use(func(c fh.Ctx) error { fh.SetClientIP(c, "127.0.0.1"); return c.Next() }, OriginLock(proxies))
+		app.Get("/healthz", func(c fh.Ctx) error { return c.SendString("ok") })
+		app.Get("/api/x", func(c fh.Ctx) error { return c.SendString("secret") })
+		resp, err := app.Test(httptest.NewRequest("GET", "http://localhost"+path, nil))
+		if err != nil || resp.StatusCode != want {
+			t.Fatalf("loopback %s: %v %v", path, resp, err)
+		}
+	}
+	if code, ip := run(t, "10.0.0.1", chain, map[string]string{"X-Forwarded-For": "192.0.2.50"}); code != 200 || ip != "192.0.2.50" {
+		t.Fatalf("proxied request: %d %s", code, ip)
+	}
+	if code, _ := run(t, "10.0.0.1", chain, map[string]string{"X-Forwarded-For": "203.0.113.77"}); code != 403 {
+		t.Fatalf("denied client network must be refused: %d", code)
+	}
+}

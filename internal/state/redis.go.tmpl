@@ -1,0 +1,130 @@
+package state
+
+import (
+	"context"
+	"errors"
+	"math/rand"
+	"time"
+
+	"github.com/oarkflow/fh/pkg/storage/kv"
+	"github.com/redis/go-redis/v9"
+)
+
+// RedisStore implements kv.Store on Redis so sessions and rate-limit counters
+// are shared by every instance and survive restarts. Keys are namespaced by
+// prefix. All operations carry a short timeout so a Redis outage degrades into
+// errors (callers fail closed) instead of hanging request goroutines.
+type RedisStore struct {
+	client  *redis.Client
+	prefix  string
+	timeout time.Duration
+}
+
+var _ kv.Store = (*RedisStore)(nil)
+
+// NewRedisStore connects from a redis:// or rediss:// URL and verifies it.
+func NewRedisStore(url, prefix string) (*RedisStore, error) {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		return nil, err
+	}
+	opts.DialTimeout, opts.ReadTimeout, opts.WriteTimeout = 2*time.Second, 2*time.Second, 2*time.Second
+	s := &RedisStore{client: redis.NewClient(opts), prefix: prefix, timeout: 2 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.client.Ping(ctx).Err(); err != nil {
+		s.client.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// Ping reports connectivity (used by readiness).
+func (s *RedisStore) Ping(ctx context.Context) error { return s.client.Ping(ctx).Err() }
+
+func (s *RedisStore) ctx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), s.timeout)
+}
+
+func (s *RedisStore) Get(key string) ([]byte, bool, error) {
+	ctx, cancel := s.ctx()
+	defer cancel()
+	v, err := s.client.Get(ctx, s.prefix+key).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return v, true, nil
+}
+
+func (s *RedisStore) Set(key string, value []byte, ttl time.Duration) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+	if ttl < 0 {
+		ttl = 0
+	}
+	return s.client.Set(ctx, s.prefix+key, value, ttl).Err()
+}
+
+func (s *RedisStore) Delete(key string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+	return s.client.Del(ctx, s.prefix+key).Err()
+}
+
+// Len counts live keys under the prefix (SCAN; for diagnostics, not hot paths).
+func (s *RedisStore) Len() (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	n := 0
+	iter := s.client.Scan(ctx, 0, s.prefix+"*", 500).Iterator()
+	for iter.Next(ctx) {
+		n++
+	}
+	return n, iter.Err()
+}
+
+func (s *RedisStore) Close() error { return s.client.Close() }
+
+// Mutate is an atomic read-modify-write using optimistic locking (WATCH/MULTI),
+// retried on contention.
+func (s *RedisStore) Mutate(key string, fn func(current []byte, exists bool) (next []byte, ttl time.Duration, ok bool, err error)) error {
+	full := s.prefix + key
+	for attempt := 0; attempt < 64; attempt++ {
+		if attempt > 0 {
+			// Jittered backoff so contending writers spread out.
+			time.Sleep(time.Duration(rand.Intn(1+attempt)) * 500 * time.Microsecond)
+		}
+		ctx, cancel := s.ctx()
+		err := s.client.Watch(ctx, func(tx *redis.Tx) error {
+			cur, err := tx.Get(ctx, full).Bytes()
+			exists := err == nil
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return err
+			}
+			next, ttl, ok, ferr := fn(cur, exists)
+			if ferr != nil {
+				return ferr
+			}
+			if !ok {
+				return nil
+			}
+			if ttl < 0 {
+				ttl = 0
+			}
+			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+				p.Set(ctx, full, next, ttl)
+				return nil
+			})
+			return err
+		}, full)
+		cancel()
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		return err
+	}
+	return errors.New("state: redis key too contended")
+}

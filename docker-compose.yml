@@ -1,0 +1,78 @@
+# Production-oriented compose. The app is NOT published on a host port: it is
+# reachable only over the internal "edge" network, from your reverse proxy
+# (Nginx Proxy Manager, Traefik, Caddy, ...), which must be attached to that
+# network. Secrets come from ./secrets (files) and .env (non-secret settings).
+#
+#   docker network create fh-edge            # once; attach your proxy to it too
+#   docker compose up -d --build
+#   docker compose --profile redis up -d     # add Redis for multi-instance state
+#
+# Set APP_TRUSTED_PROXIES in .env to the fh-edge subnet (docker network inspect fh-edge).
+
+name: fh-app
+
+services:
+  app:
+    build: .
+    image: fh-app:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_SESSION_SECRET_FILE: /run/secrets/session
+      APP_LOGIN_PASSWORD_FILE: /run/secrets/login_password
+      APP_OPERATIONS_TOKEN_FILE: /run/secrets/operations_token
+      APP_SECURE_TRANSPORT_KEY_FILE: /run/secrets/transport_key
+      APP_RESPONSE_SIGNING_PRIVATE_KEY_FILE: /run/secrets/signing_key
+      APP_BACKUP_KEY_FILE: /run/secrets/backup_key
+      # With --profile redis also set: APP_REDIS_URL_FILE=/run/secrets/redis_url and add redis_url to secrets below.
+    secrets: [session, login_password, operations_token, transport_key, signing_key, backup_key]
+    volumes:
+      - app-data:/app/data
+    networks: [edge, internal]
+    # --- hardening ---
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 1g
+    cpus: 2.0
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }   # a flood cannot fill the disk with logs
+    stop_grace_period: 30s
+
+  redis:
+    profiles: [redis]
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Password from a secret file; sessions/limits are TTL data, so no persistence.
+    command: ["sh", "-c", "exec redis-server --save '' --appendonly no --maxmemory 256mb --maxmemory-policy volatile-ttl --requirepass \"$$(cat /run/secrets/redis_password)\""]
+    secrets: [redis_password]
+    networks: [internal]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  edge:
+    name: fh-edge
+    external: true
+  internal:
+    internal: true   # Redis is reachable only from the app; it has no route out
+
+volumes:
+  app-data:
+
+secrets:
+  session:          { file: ./secrets/session }
+  login_password:   { file: ./secrets/login_password }
+  operations_token: { file: ./secrets/operations_token }
+  transport_key:    { file: ./secrets/transport_key }
+  signing_key:      { file: ./secrets/signing_key }
+  backup_key:       { file: ./secrets/backup_key }
+  # Only needed with --profile redis. redis_url = redis://:<redis_password>@redis:6379/0
+  redis_password:   { file: ./secrets/redis_password }
+  redis_url:        { file: ./secrets/redis_url }

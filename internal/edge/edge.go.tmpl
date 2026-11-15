@@ -1,0 +1,156 @@
+// Package edge holds the network-edge protections that must run before any
+// application logic: who is allowed to talk to this process at all, and how
+// the real client address is recovered when a CDN / load balancer sits in
+// front.
+//
+// Why it matters for DDoS: every other defence (the proof-of-work shield, the
+// per-IP limiter, tcpguard, audit) keys on the client IP. Behind a proxy
+// without correct handling, c.IP() is the proxy's address - one ban would lock
+// out everyone, and one attacker could hide behind a spoofed X-Forwarded-For.
+package edge
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/oarkflow/fh"
+	"github.com/oarkflow/fh/mw/realip"
+)
+
+// ParseCIDRs parses a comma-separated list of CIDRs or bare IPs.
+func ParseCIDRs(list string) ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, part := range strings.Split(list, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.Contains(part, "/") {
+			ip := net.ParseIP(part)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid IP or CIDR %q", part)
+			}
+			bits := 128
+			if ip.To4() != nil {
+				bits = 32
+			}
+			part += "/" + fmt.Sprint(bits)
+		}
+		_, n, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", part, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func contains(nets []*net.IPNet, ip net.IP) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// OriginLock refuses any TCP peer that is not a trusted proxy. With a CDN in
+// front this is the single most effective L7 measure: attackers who learn the
+// origin's address cannot bypass the CDN's filtering by connecting directly.
+// It must run BEFORE RealIP (it inspects the raw socket peer).
+func OriginLock(proxies []*net.IPNet) fh.HandlerFunc {
+	return func(c fh.Ctx) error {
+		ip := net.ParseIP(c.IP())
+		// The container/orchestrator health probe runs on the loopback of the
+		// same host or container and reaches nothing but /healthz.
+		if ip != nil && ip.IsLoopback() && c.Path() == "/healthz" {
+			return c.Next()
+		}
+		if ip == nil || !contains(proxies, ip) {
+			return c.SendStatus(fh.StatusForbidden)
+		}
+		return c.Next()
+	}
+}
+
+// RealIP rewrites the effective client address from forwarding headers, but
+// only when the socket peer is one of the trusted proxies; chains are walked
+// right-to-left so a client-forged leftmost value is ignored. With no trusted
+// proxies it is a no-op: headers from the public internet are never believed.
+func RealIP(proxies []*net.IPNet) fh.HandlerFunc {
+	if len(proxies) == 0 {
+		return func(c fh.Ctx) error { return c.Next() }
+	}
+	return realip.New(realip.Config{TrustedProxies: proxies})
+}
+
+// DenyList drops traffic from statically blocked networks with a cheap prefix
+// check. Place it after RealIP so it sees the real client.
+func DenyList(nets []*net.IPNet) fh.HandlerFunc {
+	if len(nets) == 0 {
+		return func(c fh.Ctx) error { return c.Next() }
+	}
+	return func(c fh.Ctx) error {
+		if ip := net.ParseIP(c.IP()); ip != nil && contains(nets, ip) {
+			return c.SendStatus(fh.StatusForbidden)
+		}
+		return c.Next()
+	}
+}
+
+// ListenOptions selects how the process accepts connections.
+type ListenOptions struct {
+	Addr string
+	// ProxyProtocol accepts HAProxy PROXY v1/v2 headers (L4 load balancers
+	// such as AWS NLB, HAProxy, nginx stream) from TrustedPeers only. Strict:
+	// a connection without a valid header from a trusted peer is dropped, so
+	// the origin is also locked to the load balancer at the TCP level.
+	ProxyProtocol bool
+	TrustedPeers  []*net.IPNet
+	Timeout       time.Duration
+	ShutdownWait  time.Duration
+}
+
+// Serve listens and blocks until SIGINT/SIGTERM, then drains gracefully. It
+// mirrors app.ListenWithGracefulShutdown but can sit behind PROXY protocol.
+func Serve(app *fh.App, opts ListenOptions, logInfo func(string, ...any), logErr func(string, ...any)) error {
+	if !opts.ProxyProtocol {
+		return app.ListenWithGracefulShutdown(opts.Addr)
+	}
+	if len(opts.TrustedPeers) == 0 {
+		return fmt.Errorf("edge: PROXY protocol requires trusted proxy addresses")
+	}
+	var lc net.ListenConfig
+	lc.KeepAlive = 15 * time.Second
+	raw, err := lc.Listen(context.Background(), "tcp", opts.Addr)
+	if err != nil {
+		return err
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = 3 * time.Second
+	}
+	ln := fh.NewProxyProtocolListener(raw, fh.ProxyProtocolConfig{
+		Timeout: opts.Timeout, TrustedPeers: opts.TrustedPeers, MaxPendingHandshakes: 256, MaxHeaderBytes: 1024,
+	})
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		logInfo("signal received, starting graceful shutdown")
+		wait := opts.ShutdownWait
+		if wait <= 0 {
+			wait = 20 * time.Second
+		}
+		sctx, cancel := context.WithTimeout(context.Background(), wait)
+		defer cancel()
+		if err := app.ShutdownWithContext(sctx); err != nil {
+			logErr("graceful shutdown error", "error", err)
+		}
+	}()
+	return app.Serve(ln)
+}

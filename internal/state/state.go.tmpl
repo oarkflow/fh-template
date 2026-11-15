@@ -1,0 +1,31 @@
+// Package state chooses where short-lived server state lives (sessions, rate
+// limit counters): Redis when APP_REDIS_URL is set (shared across instances,
+// survives restarts), otherwise a 0700 directory on disk (survives restarts of
+// a single node) - never silent process memory in production, so a deploy or
+// crash does not sign every user out.
+package state
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/oarkflow/fh/pkg/storage/kv"
+)
+
+// Open returns the store for the named purpose ("sessions", "ratelimit").
+// redisURL may be empty.
+func Open(purpose, redisURL, dataDir string) (kv.Store, error) {
+	if redisURL != "" {
+		return NewRedisStore(redisURL, "fh:"+purpose+":")
+	}
+	dir := dataDir + "/" + purpose
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create %s state directory: %w", purpose, err)
+	}
+	// MkdirAll does not tighten a pre-existing directory.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("secure %s state directory: %w", purpose, err)
+	}
+	return kv.NewFileStore(dir, kv.WithFileGCInterval(time.Minute))
+}

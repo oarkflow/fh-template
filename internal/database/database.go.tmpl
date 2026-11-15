@@ -81,6 +81,7 @@ func OpenWithPool(url string, pool PoolConfig) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	restrictDatabaseFiles(url)
 	return &Store{
 		DB:    db,
 		Users: squealx.New[User](db, "users", "id"),
@@ -117,6 +118,49 @@ func migrate(db *squealx.DB) error {
 	return nil
 }
 
+// restrictDatabaseFiles makes the SQLite file and its WAL/journal siblings
+// readable by the server's user only, so other local accounts cannot read user
+// data at rest. Best-effort: a sibling that does not exist yet is skipped, and
+// the 0700 data directory already denies traversal to other users.
+func restrictDatabaseFiles(databaseURL string) {
+	if !strings.HasPrefix(databaseURL, "file:") {
+		return
+	}
+	path := strings.SplitN(strings.TrimPrefix(databaseURL, "file:"), "?", 2)[0]
+	if path == "" || path == ":memory:" {
+		return
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		_ = os.Chmod(path+suffix, 0o600)
+	}
+}
+
+// SQLitePath returns the filesystem path of a file: database URL ("" for
+// in-memory or non-file URLs).
+func SQLitePath(databaseURL string) string {
+	if !strings.HasPrefix(databaseURL, "file:") {
+		return ""
+	}
+	path := strings.SplitN(strings.TrimPrefix(databaseURL, "file:"), "?", 2)[0]
+	if path == ":memory:" {
+		return ""
+	}
+	return path
+}
+
+// QuickCheck runs SQLite's PRAGMA quick_check and reports corruption early,
+// at startup, instead of on a user's request.
+func (s *Store) QuickCheck(ctx context.Context) error {
+	var result string
+	if err := s.DB.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("database integrity check failed: %s", result)
+	}
+	return nil
+}
+
 func ensureSQLiteDirectory(databaseURL string) error {
 	if strings.HasPrefix(databaseURL, "file:") {
 		path := strings.TrimPrefix(databaseURL, "file:")
@@ -124,7 +168,7 @@ func ensureSQLiteDirectory(databaseURL string) error {
 		if path == "" || path == ":memory:" || strings.HasPrefix(path, "/") {
 			return nil
 		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return fmt.Errorf("create database directory: %w", err)
 		}
 	}

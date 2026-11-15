@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	appedge "__FH_MODULE__/internal/edge"
 	fhconfig "github.com/oarkflow/fh/pkg/config"
 )
 
@@ -33,6 +34,26 @@ type Config struct {
 	RequestTimeout            time.Duration
 	MaxBodyBytes              int
 	RateLimit                 int
+	// Shield (load-adaptive proof-of-work admission; see internal/shield).
+	ShieldEnabled     bool
+	ShieldCapacity    int
+	ShieldRate        int
+	ShieldMaxBits     int
+	ShieldPassBudget  int
+	ShieldUnderAttack bool
+	// Edge / proxy handling (see internal/edge).
+	TrustedProxies []*net.IPNet
+	ProxyProtocol  bool
+	OriginLock     bool
+	DenyNetworks   []*net.IPNet
+	LoginRateLimit int
+	// Durable state and backups.
+	RedisURL       string
+	StateDir       string
+	BackupDir      string
+	BackupInterval time.Duration // 0 disables scheduled backups
+	BackupKeep     int
+	BackupKey      []byte
 }
 
 func Load() (Config, error) {
@@ -95,8 +116,83 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	shieldCapacity, err := positiveInt("APP_SHIELD_CAPACITY", 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	shieldRate, err := positiveInt("APP_SHIELD_RATE", 2000)
+	if err != nil {
+		return Config{}, err
+	}
+	shieldMaxBits, err := positiveInt("APP_SHIELD_MAX_BITS", 22)
+	if err != nil || shieldMaxBits > 28 {
+		return Config{}, fmt.Errorf("APP_SHIELD_MAX_BITS must be an integer between 1 and 28")
+	}
+
+	trustedProxies, err := appedge.ParseCIDRs(os.Getenv("APP_TRUSTED_PROXIES"))
+	if err != nil {
+		return Config{}, fmt.Errorf("APP_TRUSTED_PROXIES: %w", err)
+	}
+	denyNetworks, err := appedge.ParseCIDRs(os.Getenv("APP_DENY_CIDRS"))
+	if err != nil {
+		return Config{}, fmt.Errorf("APP_DENY_CIDRS: %w", err)
+	}
+	proxyProtocol := strings.EqualFold(env("APP_PROXY_PROTOCOL", "off"), "on")
+	// Locking the origin to its proxies is on by default whenever proxies are
+	// declared: otherwise an attacker who finds the origin address skips the
+	// CDN/WAF entirely.
+	originLock := len(trustedProxies) > 0 && !strings.EqualFold(env("APP_ORIGIN_LOCK", "on"), "off")
+	if proxyProtocol && len(trustedProxies) == 0 {
+		return Config{}, fmt.Errorf("APP_PROXY_PROTOCOL=on requires APP_TRUSTED_PROXIES (the load balancer addresses)")
+	}
+	loginRate, err := positiveInt("APP_LOGIN_RATE_LIMIT", 10)
+	if err != nil {
+		return Config{}, err
+	}
+	redisURL, err := fhconfig.SecretString("APP_REDIS_URL", "APP_REDIS_URL_FILE")
+	if err != nil {
+		return Config{}, err
+	}
+	stateDir := env("APP_STATE_DIR", "data")
+	backupInterval := time.Duration(0)
+	if v := strings.ToLower(env("APP_BACKUP_INTERVAL", "")); v == "" {
+		if production {
+			backupInterval = 6 * time.Hour
+		}
+	} else if v != "off" {
+		backupInterval, err = time.ParseDuration(v)
+		if err != nil || backupInterval < time.Minute {
+			return Config{}, fmt.Errorf("APP_BACKUP_INTERVAL must be a duration of at least 1m, or \"off\"")
+		}
+	}
+	backupKeep, err := positiveInt("APP_BACKUP_KEEP", 14)
+	if err != nil {
+		return Config{}, err
+	}
+	backupKeyValue, err := fhconfig.SecretString("APP_BACKUP_KEY", "APP_BACKUP_KEY_FILE")
+	if err != nil {
+		return Config{}, err
+	}
+	var backupKey []byte
+	if backupKeyValue != "" {
+		backupKey, err = base64.RawURLEncoding.DecodeString(backupKeyValue)
+		if err != nil || len(backupKey) != 32 {
+			return Config{}, fmt.Errorf("APP_BACKUP_KEY must be exactly 32 random base64url bytes (see: go run ./cmd/server -generate-backup-key)")
+		}
+	}
+	if production && backupInterval > 0 && len(backupKey) == 0 {
+		return Config{}, fmt.Errorf("APP_BACKUP_KEY_FILE is required in production when backups are enabled (backups contain user data); set APP_BACKUP_INTERVAL=off to disable them")
+	}
+	shieldPassBudget, err := positiveInt("APP_SHIELD_PASS_BUDGET", 600)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
+		RedisURL: redisURL, StateDir: stateDir, BackupDir: env("APP_BACKUP_DIR", stateDir+"/backups"), BackupInterval: backupInterval, BackupKeep: backupKeep, BackupKey: backupKey,
+		ShieldPassBudget: shieldPassBudget, ShieldUnderAttack: strings.EqualFold(env("APP_UNDER_ATTACK", "off"), "on"),
+		TrustedProxies: trustedProxies, ProxyProtocol: proxyProtocol, OriginLock: originLock, DenyNetworks: denyNetworks, LoginRateLimit: loginRate,
+		ShieldEnabled: !strings.EqualFold(env("APP_SHIELD", "on"), "off"), ShieldCapacity: shieldCapacity, ShieldRate: shieldRate, ShieldMaxBits: shieldMaxBits,
 		Environment: environment, Production: production, Address: env("APP_ADDR", "127.0.0.1:8080"), Origin: origin,
 		AllowedHosts: allowedHosts, AllowedOrigins: allowedOrigins, DatabaseURL: env("APP_DATABASE_URL", "file:data/app.db?_pragma=foreign_keys(1)"),
 		SessionSecret: sessionSecret, LoginUser: env("APP_LOGIN_USER", "admin"), LoginPassword: loginPassword,

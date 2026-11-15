@@ -1,0 +1,38 @@
+# systemd unit: resource ceilings and sandboxing so a flood or an exploit has a
+# small blast radius. Adjust paths/user. Install: /etc/systemd/system/fh-app.service
+[Unit]
+Description=FH application
+After=network-online.target
+
+[Service]
+User=fhapp
+Group=fhapp
+WorkingDirectory=/opt/fh-app
+EnvironmentFile=/opt/fh-app/.env
+ExecStart=/opt/fh-app/server
+Restart=always
+RestartSec=2
+LimitNOFILE=262144
+TasksMax=4096
+MemoryHigh=1536M
+MemoryMax=2G
+CPUQuota=300%
+# Sandbox
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+ReadWritePaths=/opt/fh-app/data
+
+[Install]
+WantedBy=multi-user.target

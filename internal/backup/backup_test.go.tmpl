@@ -1,0 +1,105 @@
+package backup
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	appdb "__FH_MODULE__/internal/database"
+)
+
+func openDB(t *testing.T, path string) *appdb.Store {
+	t.Helper()
+	s, err := appdb.Open("file:" + path + "?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestBackupRestoreRoundTrip(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		dir := t.TempDir()
+		store := openDB(t, filepath.Join(dir, "live.db"))
+		if _, err := store.DB.ExecContext(context.Background(), `INSERT INTO users (id, name, role) VALUES ('u1', 'Alice', 'viewer')`); err != nil {
+			t.Fatal(err)
+		}
+		var key []byte
+		if encrypted {
+			key = bytes.Repeat([]byte{7}, 32)
+		}
+		path, err := Run(context.Background(), store.DB, Config{Dir: filepath.Join(dir, "bk"), Key: key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, _ := os.Stat(path)
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("snapshot mode %v", info.Mode())
+		}
+		if encrypted {
+			raw, _ := os.ReadFile(path)
+			if bytes.Contains(raw, []byte("Alice")) || !strings.HasSuffix(path, ".enc") {
+				t.Fatal("encrypted snapshot leaks plaintext")
+			}
+			if err := Restore(path, filepath.Join(dir, "r1.db"), bytes.Repeat([]byte{8}, 32)); err == nil {
+				t.Fatal("restore with the wrong key must fail")
+			}
+			if err := Restore(path, filepath.Join(dir, "r0.db"), nil); err == nil {
+				t.Fatal("restore of encrypted snapshot without key must fail")
+			}
+		}
+		dst := filepath.Join(dir, "restored.db")
+		if err := Restore(path, dst, key); err != nil {
+			t.Fatal(err)
+		}
+		if err := Restore(path, dst, key); err == nil {
+			t.Fatal("restore must refuse to overwrite")
+		}
+		restored := openDB(t, dst)
+		var name string
+		if err := restored.DB.QueryRow(`SELECT name FROM users WHERE id='u1'`).Scan(&name); err != nil || name != "Alice" {
+			t.Fatalf("restored data: %q %v", name, err)
+		}
+	}
+}
+
+func TestTamperedSnapshotRejected(t *testing.T) {
+	dir := t.TempDir()
+	store := openDB(t, filepath.Join(dir, "live.db"))
+	key := bytes.Repeat([]byte{1}, 32)
+	path, err := Run(context.Background(), store.DB, Config{Dir: dir, Key: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	raw[len(raw)-5] ^= 0xff
+	os.WriteFile(path, raw, 0o600)
+	if err := Restore(path, filepath.Join(dir, "x.db"), key); err == nil {
+		t.Fatal("tampered snapshot accepted")
+	}
+}
+
+func TestRetentionPrunesOldest(t *testing.T) {
+	dir := t.TempDir()
+	store := openDB(t, filepath.Join(dir, "live.db"))
+	now := time.Unix(1_700_000_000, 0)
+	for i := 0; i < 5; i++ {
+		i := i
+		if _, err := Run(context.Background(), store.DB, Config{Dir: filepath.Join(dir, "bk"), Keep: 3, Now: func() time.Time { return now.Add(time.Duration(i) * time.Hour) }}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, _ := os.ReadDir(filepath.Join(dir, "bk"))
+	if len(entries) != 3 {
+		t.Fatalf("kept %d snapshots, want 3", len(entries))
+	}
+	latest, err := Latest(filepath.Join(dir, "bk"))
+	if err != nil || !strings.Contains(latest, now.Add(4*time.Hour).UTC().Format("20060102T150405Z")) {
+		t.Fatalf("latest=%s err=%v", latest, err)
+	}
+}

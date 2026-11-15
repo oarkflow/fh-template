@@ -267,7 +267,9 @@ func renderIndex(c fh.Ctx, production bool) error {
 		if !bytes.Contains(body, closing) {
 			return nil, fmt.Errorf("index template is missing </body>")
 		}
-		boot := []byte(`<script src="/assets/app.js" type="module"></script></body>`)
+		// shield-boot.js loads first (module scripts run in order) so every
+		// fetch the application makes can answer a DDoS-shield puzzle.
+		boot := []byte(`<script src="/wasm/shield-boot.js" type="module"></script><script src="/assets/app.js" type="module"></script></body>`)
 		return bytes.Replace(body, closing, boot, 1), nil
 	})
 	return c.Render("index.html", map[string]any{"Production": production, "message": ""})

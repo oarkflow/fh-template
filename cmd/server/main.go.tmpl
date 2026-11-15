@@ -3,20 +3,32 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	appauth "__FH_MODULE__/internal/auth"
+	appbackup "__FH_MODULE__/internal/backup"
 	appconfig "__FH_MODULE__/internal/config"
 	appdb "__FH_MODULE__/internal/database"
+	appedge "__FH_MODULE__/internal/edge"
 	apphttp "__FH_MODULE__/internal/httpapi"
 	appsecurity "__FH_MODULE__/internal/security"
+	appstate "__FH_MODULE__/internal/state"
+	appshield "__FH_MODULE__/internal/shield"
 	"github.com/oarkflow/fh"
 	contriblogger "github.com/oarkflow/fh-contrib/logger"
 	authzmw "github.com/oarkflow/fh-contrib/mw/authz"
@@ -34,10 +46,10 @@ import (
 	"github.com/oarkflow/fh/mw/security"
 	"github.com/oarkflow/fh/mw/session"
 	"github.com/oarkflow/fh/mw/skip"
+	"github.com/oarkflow/fh/mw/slowloris"
 	"github.com/oarkflow/fh/mw/timeout"
 	responseprotocol "github.com/oarkflow/fh/pkg/httpsignature"
 	secureprotocol "github.com/oarkflow/fh/pkg/securetransport"
-	"github.com/oarkflow/fh/pkg/storage/kv"
 	"github.com/oarkflow/template"
 	"github.com/oarkflow/zlog"
 )
@@ -45,7 +57,19 @@ import (
 func main() {
 	generateTransport := flag.Bool("generate-transport-key", false, "print a base64url X25519 private key")
 	generateSigning := flag.Bool("generate-signing-key", false, "print an Ed25519 private seed and public key")
+	generateBackup := flag.Bool("generate-backup-key", false, "print a base64url AES-256 backup encryption key")
+	doBackup := flag.Bool("backup", false, "write one database snapshot to APP_BACKUP_DIR and exit")
+	restore := flag.String("restore", "", "restore the database from this snapshot (or \"latest\") into a missing database file, then exit")
+	healthcheck := flag.Bool("healthcheck", false, "probe the local /healthz endpoint and exit 0/1 (for container HEALTHCHECK)")
 	flag.Parse()
+	if *generateBackup {
+		var key [32]byte
+		if _, err := rand.Read(key[:]); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("APP_BACKUP_KEY=%s\n", base64.RawURLEncoding.EncodeToString(key[:]))
+		return
+	}
 	if *generateTransport {
 		generateTransportKey()
 		return
@@ -55,9 +79,20 @@ func main() {
 		return
 	}
 
+	if *healthcheck {
+		// Deliberately independent of appconfig.Load: a probe must not need
+		// secrets, and must still answer if a secret file is unreadable.
+		os.Exit(runHealthcheck())
+	}
 	cfg, err := appconfig.Load()
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *restore != "" {
+		if err := runRestore(cfg, *restore); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 	zlogger := zlog.NewProduction()
 	appLogger := &contriblogger.ZlogAdapter{Logger: zlogger}
@@ -66,6 +101,23 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	if err := db.QuickCheck(context.Background()); err != nil {
+		log.Fatalf("%v - restore the latest snapshot with: server -restore latest (after moving the damaged database aside)", err)
+	}
+	backupConfig := appbackup.Config{Dir: cfg.BackupDir, Keep: cfg.BackupKeep, Key: cfg.BackupKey}
+	if *doBackup {
+		path, err := appbackup.Run(context.Background(), db.DB, backupConfig)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(path)
+		return
+	}
+	if cfg.BackupInterval > 0 {
+		go appbackup.Loop(context.Background(), db.DB, backupConfig, cfg.BackupInterval, slog.Default())
+	} else if cfg.Production {
+		appLogger.Warn("scheduled database backups are disabled (APP_BACKUP_INTERVAL=off)")
+	}
 	engine, err := authzmw.LoadEngineFromAuthzFile("policy.authz")
 	if err != nil {
 		log.Fatal(err)
@@ -90,7 +142,11 @@ func main() {
 		fh.WithLogger(appLogger), fh.WithTemplateEngine(view), fh.WithEnvironment(environment), fh.WithMode(mode), fh.WithSecureByDefault(cfg.Production),
 		fh.WithAllowedHosts(cfg.AllowedHosts...), fh.WithMaxRequestBodySize(cfg.MaxBodyBytes), fh.WithHandlerTimeout(cfg.RequestTimeout),
 		fh.WithReadHeaderTimeout(5*time.Second), fh.WithRequestBodyTimeout(10*time.Second), fh.WithShutdownTimeout(20*time.Second),
-		fh.WithMaxConnectionsPerIP(100), fh.WithMaxInFlightRequests(1_000), fh.WithMaxHeaderCount(64), fh.WithMaxHeaderListSize(32<<10),
+		fh.WithMaxConnectionsPerIP(100), fh.WithMaxInFlightRequests(1_000),
+		// Connection-level flood limits: a global ceiling (file descriptors),
+		// reaping idle keep-alives, and a bound on HTTP/2 streams per
+		// connection (HTTP/2 rapid-reset style abuse).
+		fh.WithMaxConnections(10_000), fh.WithIdleTimeout(30*time.Second), fh.WithMaxConcurrentStreams(100), fh.WithMaxHeaderCount(64), fh.WithMaxHeaderListSize(32<<10),
 	)
 
 	secureCookie := cfg.Production
@@ -98,13 +154,46 @@ func main() {
 	if secureCookie {
 		cookieName = "__Host-fh_session"
 	}
+	sessionStore, err := appstate.Open("sessions", cfg.RedisURL, cfg.StateDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer sessionStore.Close()
+	rateStore, err := appstate.Open("ratelimit", cfg.RedisURL, cfg.StateDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rateStore.Close()
+	loginStore, err := appstate.Open("loginlimit", cfg.RedisURL, cfg.StateDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer loginStore.Close()
 	sessions := session.NewSessionManager(
-		kv.NewMemoryStore(kv.WithGCInterval(time.Minute), kv.WithMaxEntries(100_000)),
+		sessionStore,
 		session.SessionSecret(cfg.SessionSecret), session.SessionCookieName(cookieName), session.SessionMaxAge(30*time.Minute),
 		session.SessionHTTPOnly(true), session.SessionSecure(secureCookie), session.SessionSameSite(fh.SameSiteStrict), session.SessionPath("/"),
 	)
 	requestMetrics := metrics.New()
+	var underAttack atomic.Bool
+	underAttack.Store(cfg.ShieldUnderAttack)
+	shieldMiddleware, shieldStats := newShield(cfg, appLogger, &underAttack)
 	app.Use(
+		// First in the chain: refuse work outright when the process itself is
+		// short of goroutines or heap, before logging or anything allocates.
+		// Edge first: refuse non-proxy peers, recover the real client IP from
+		// trusted proxies only, drop denied networks. Everything below (shield,
+		// limiter, tcpguard, audit) then keys on the true client address.
+		edgeLock(cfg),
+		appedge.RealIP(cfg.TrustedProxies),
+		appedge.DenyList(cfg.DenyNetworks),
+		slowloris.New(slowloris.Config{MaxGoroutines: 20_000, MaxHeapBytes: 1 << 30, SampleInterval: 250 * time.Millisecond}),
+		// Pressure-priced admission: free while calm, proof-of-work under load,
+		// and a cheap early drop for banned offenders. It sits ahead of the
+		// request logger, audit log and metrics on purpose - a flood must not
+		// be able to fill the disk or CPU through per-request log lines; the
+		// shield reports ban/abuse transitions itself and counts the rest.
+		shieldMiddleware,
 		requestid.New(),
 		logger.New(logger.Config{Logger: appLogger, FormatName: "json", SkipDefaultStatic: true}),
 		requestMetrics.Middleware(),
@@ -119,11 +208,16 @@ func main() {
 		}),
 		cors.New(cors.Config{
 			AllowOrigins: cfg.AllowedOrigins, AllowMethods: []string{"GET", "POST", "OPTIONS"},
-			AllowHeaders:  []string{"Origin", "Content-Type", "Accept", "Accept-Signature", "X-FH-Envelope", "X-FH-Device-Registration"},
-			ExposeHeaders: []string{"X-Request-ID", "X-FH-Response", "Content-Digest", "Signature-Input", "Signature"}, AllowCredentials: true, MaxAge: 600,
+			AllowHeaders:  []string{"Origin", "Content-Type", "Accept", "Accept-Signature", appshield.HeaderSolution, "X-FH-Envelope", "X-FH-Device-Registration"},
+			ExposeHeaders: []string{appshield.HeaderChallenge, appshield.HeaderBits, "Retry-After", "X-Request-ID", "X-FH-Response", "Content-Digest", "Signature-Input", "Signature"}, AllowCredentials: true, MaxAge: 600,
 		}),
+		noStorePrivate,
 		bodylimit.New(cfg.MaxBodyBytes), timeout.New(cfg.RequestTimeout),
-		ratelimiter.New(ratelimiter.Config{Max: cfg.RateLimit, Window: time.Minute, SendHeaders: true}),
+		ratelimiter.New(ratelimiter.Config{Max: cfg.RateLimit, Window: time.Minute, SendHeaders: true, Store: rateStore}),
+		// Credential endpoints get a much tighter per-IP budget: password
+		// guessing and bootstrap churn are the expensive, abusable calls.
+		ratelimiter.New(ratelimiter.Config{Max: cfg.LoginRateLimit, Window: time.Minute, SendHeaders: false, Store: loginStore,
+			Skip: func(c fh.Ctx) bool { return c.Path() != "/auth/login" && c.Path() != "/secure-config.json" }}),
 		guard.Middleware(skipStaticAndOps),
 		skip.New(session.New(sessions), skip.Any(skip.Paths("/", "/healthz"), skip.Prefixes("/assets/", "/wasm/", "/_ops/"))),
 	)
@@ -175,17 +269,35 @@ func main() {
 	app.Use(signer)
 	responsePublicValue, _ := responseprotocol.EncodePublicKey(responsePublic)
 	app.AddHealthCheck("database", 2*time.Second, db.Ping)
+	if redisStore, ok := sessionStore.(*appstate.RedisStore); ok {
+		app.AddHealthCheck("redis", 2*time.Second, redisStore.Ping)
+	}
 	if err := apphttp.Register(app, cfg, sessions, transport, engine, grants, guard, db, responsePublicValue); err != nil {
 		log.Fatal(err)
 	}
+	app.Post("/_ops/shield/attack", operationAuth(cfg.OperationsToken), func(c fh.Ctx) error {
+		on := c.Query("on") == "1"
+		underAttack.Store(on)
+		appLogger.Warn("under_attack_mode", "enabled", on, "ip", c.IP())
+		return c.JSON(fh.Map{"under_attack": on})
+	}).Name("shield-attack").Tag("operations")
+	app.Get("/_ops/shield", operationAuth(cfg.OperationsToken), shieldStats).Name("shield").Tag("operations")
 	app.Get("/_ops/metrics", operationAuth(cfg.OperationsToken), requestMetrics.Handler()).Name("metrics").Tag("operations")
 	app.EnableHealth("/_ops", operationAuth(cfg.OperationsToken))
 	app.EnableRuntime("/_ops", operationAuth(cfg.OperationsToken))
 	if ephemeralTransport || ephemeralSigning {
 		appLogger.Warn("development-only ephemeral cryptographic keys are active")
 	}
+	switch {
+	case len(cfg.TrustedProxies) == 0 && cfg.Production:
+		appLogger.Warn("no APP_TRUSTED_PROXIES: treating every peer as a direct client and ignoring X-Forwarded-For. If a proxy/CDN/load balancer fronts this server, set it - otherwise all clients share the proxy's address and one ban or rate limit affects everyone")
+	case len(cfg.TrustedProxies) > 0:
+		appLogger.Info("edge configured", "trusted_proxies", len(cfg.TrustedProxies), "origin_lock", cfg.OriginLock, "proxy_protocol", cfg.ProxyProtocol, "denied_networks", len(cfg.DenyNetworks))
+	}
 	appLogger.Info("starting server", "addr", cfg.Address, "origin", cfg.Origin, "environment", cfg.Environment)
-	log.Fatal(app.ListenWithGracefulShutdown(cfg.Address))
+	log.Fatal(appedge.Serve(app, appedge.ListenOptions{
+		Addr: cfg.Address, ProxyProtocol: cfg.ProxyProtocol, TrustedPeers: cfg.TrustedProxies, ShutdownWait: 20 * time.Second,
+	}, func(msg string, kv ...any) { appLogger.Info(msg, kv...) }, func(msg string, kv ...any) { appLogger.Error(msg, kv...) }))
 }
 
 func transportKey(cfg appconfig.Config) ([]byte, bool, error) {
@@ -221,12 +333,76 @@ func operationAuth(token string) fh.HandlerFunc {
 	}
 }
 
+// edgeLock refuses connections that do not come from a declared trusted proxy.
+// With PROXY protocol the listener already enforces this at the TCP level (and
+// the socket address seen here is the client's), so it is a no-op then.
+func edgeLock(cfg appconfig.Config) fh.HandlerFunc {
+	if !cfg.OriginLock || cfg.ProxyProtocol {
+		return func(c fh.Ctx) error { return c.Next() }
+	}
+	return appedge.OriginLock(cfg.TrustedProxies)
+}
+
+// noStorePrivate stops browsers and intermediaries caching anything that is
+// not a public static asset: API, auth, bootstrap and operations responses can
+// carry user data, so they must never land in a shared or on-disk cache.
+func noStorePrivate(c fh.Ctx) error {
+	path := c.Path()
+	if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/auth/") || strings.HasPrefix(path, "/_ops/") || path == "/secure-config.json" {
+		c.Set("Cache-Control", "no-store")
+		c.Set("Pragma", "no-cache")
+	}
+	return c.Next()
+}
+
+// newShield builds the DDoS shield middleware and its /_ops/shield stats
+// handler. The HMAC key is derived from the session secret with a domain
+// label, so there is no extra secret to provision or rotate separately.
+func newShield(cfg appconfig.Config, log interface {
+	Warn(string, ...any)
+	Error(string, ...any)
+}, underAttack *atomic.Bool) (fh.HandlerFunc, fh.HandlerFunc) {
+	if !cfg.ShieldEnabled {
+		pass := func(c fh.Ctx) error { return c.Next() }
+		return pass, func(c fh.Ctx) error { return c.JSON(fh.Map{"enabled": false}) }
+	}
+	mac := hmac.New(sha256.New, cfg.SessionSecret)
+	mac.Write([]byte("fh-shield-v1"))
+	s, err := appshield.New(appshield.Config{
+		Secret: mac.Sum(nil), Capacity: int64(cfg.ShieldCapacity), RatePerSecond: float64(cfg.ShieldRate),
+		// Operator "under attack" switch: pins pressure at 100% (maximum
+		// difficulty) regardless of measured load, until switched off.
+		Force: func() (float64, bool) { return 1.0, underAttack.Load() },
+		MaxBits: cfg.ShieldMaxBits, PassBudget: cfg.ShieldPassBudget, Secure: cfg.Production, Skip: skipStaticAndOps,
+		OnEvent: func(event, ip string, bits int) {
+			switch event {
+			case "ban":
+				// Error level: the async logger sheds Warn-and-below entries
+				// when its queue is full, which is exactly when a flood is
+				// being banned. Bans are rare, so they must not be droppable.
+				log.Error("shield_ban", "ip", ip, "seconds", bits)
+			case "invalid", "replay", "budget":
+				log.Warn("shield_event", "event", event, "ip", ip, "bits", bits)
+			}
+		},
+	})
+	if err != nil {
+		log.Warn("shield disabled", "error", err.Error())
+		return func(c fh.Ctx) error { return c.Next() }, func(c fh.Ctx) error { return c.JSON(fh.Map{"enabled": false}) }
+	}
+	return s.Middleware(), func(c fh.Ctx) error {
+		p := s.Pressure()
+		return c.JSON(fh.Map{"enabled": true, "pressure": p, "bits": s.Bits(p), "challenged": s.Challenged.Load(),
+			"solved": s.Solved.Load(), "passed": s.Passed.Load(), "banned": s.Banned.Load(), "budget_exceeded": s.BudgetExceeded.Load(), "rejected": s.Rejected.Load()})
+	}
+}
+
 // skipStaticAndOps exempts static assets and framework-only endpoints from
 // tcpguard evaluation - anomaly detection is only meaningful for routes that
 // execute application/business logic.
 func skipStaticAndOps(c fh.Ctx) bool {
 	path := c.Path()
-	if path == "/" || path == "/healthz" {
+	if path == "/" || path == "/healthz" || path == "/favicon.ico" {
 		return true
 	}
 	for _, prefix := range []string{"/assets/", "/wasm/", "/_ops/"} {
@@ -263,6 +439,68 @@ func generateTransportKey() {
 	}
 	fmt.Printf("APP_SECURE_TRANSPORT_KEY=%s\nWASM_TRUSTED_TRANSPORT_KEY=%s\n", value, base64.RawURLEncoding.EncodeToString(public[:]))
 }
+// runHealthcheck is the container HEALTHCHECK: distroless images have no curl.
+// It reads only APP_ADDR / APP_ORIGIN / APP_PROXY_PROTOCOL from the environment,
+// sends the public origin's Host header (production rejects unknown hosts), and
+// exits 0 only on HTTP 200. With PROXY protocol the listener refuses plain HTTP,
+// so only a TCP connect is attempted.
+func runHealthcheck() int {
+	addr := os.Getenv("APP_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8080"
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 1
+	}
+	target := net.JoinHostPort("127.0.0.1", port)
+	if strings.EqualFold(os.Getenv("APP_PROXY_PROTOCOL"), "on") {
+		conn, err := net.DialTimeout("tcp", target, 2*time.Second)
+		if err != nil {
+			return 1
+		}
+		conn.Close()
+		return 0
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://"+target+"/healthz", nil)
+	if u, err := url.Parse(os.Getenv("APP_ORIGIN")); err == nil && u.Host != "" {
+		req.Host = u.Host
+	}
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "healthcheck: status", resp.StatusCode)
+		return 1
+	}
+	return 0
+}
+
+// runRestore rebuilds the database file from a snapshot. It refuses to
+// overwrite an existing database so the damaged file is never the only thing
+// destroyed; move it aside first.
+func runRestore(cfg appconfig.Config, source string) error {
+	dst := appdb.SQLitePath(cfg.DatabaseURL)
+	if dst == "" {
+		return fmt.Errorf("APP_DATABASE_URL is not a file database")
+	}
+	if source == "latest" {
+		latest, err := appbackup.Latest(cfg.BackupDir)
+		if err != nil {
+			return err
+		}
+		source = latest
+	}
+	if err := appbackup.Restore(source, dst, cfg.BackupKey); err != nil {
+		return err
+	}
+	fmt.Printf("restored %s -> %s\n", source, dst)
+	return nil
+}
+
 func generateSigningKey() {
 	public, private, err := responseprotocol.GenerateKey()
 	if err != nil {

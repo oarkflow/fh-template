@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+data
+web/public
+web/frontend/node_modules
+web/frontend/dist
+*.db
+*.db-wal
+*.db-shm
+bin
+node_modules
+.github

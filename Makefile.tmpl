@@ -1,7 +1,7 @@
 GO ?= go
 NPM ?= npm
 
-.PHONY: check test run keys wasm frontend check-secure-fetch test-secure-fetch
+.PHONY: check test run keys wasm wasm-docker backup e2e frontend check-secure-fetch test-secure-fetch
 
 check:
 	$(GO) test ./...
@@ -16,7 +16,7 @@ check-secure-fetch:
 	cd web/frontend && $(NPM) run check:secure-fetch
 
 test-secure-fetch:
-	node --test web/wasm/coalesce.test.mjs
+	node --test web/wasm/coalesce.test.mjs web/wasm/pow.test.mjs
 
 test:
 	$(GO) test ./...
@@ -41,12 +41,28 @@ frontend: check-secure-fetch
 #   go install golang.org/dl/go1.27.3@latest && go1.27.3 download
 #   PATH="$$(go1.27.3 env GOROOT)/bin:$$PATH" make wasm
 TINYGO ?= tinygo
+# The client pins the server key at runtime from /secure-config.json (served over
+# TLS, with WASM/runtime subresource-integrity), so no keys are compiled in.
+# Hermetic alternative (no local TinyGo): make wasm-docker
 wasm:
 	@mkdir -p web/wasm
-	@test -n "$(WASM_TRUSTED_ORIGIN)" -a -n "$(WASM_TRUSTED_TRANSPORT_KEY)" -a -n "$(WASM_TRUSTED_TRANSPORT_KEY_ID)" -a -n "$(WASM_TRUSTED_RESPONSE_KEY)" -a -n "$(WASM_TRUSTED_RESPONSE_KEY_ID)" || (echo "all five WASM_TRUSTED_* values are required" >&2; exit 1)
-	@command -v $(TINYGO) >/dev/null 2>&1 || (echo "tinygo was not found on PATH. Install it (e.g. 'brew install tinygo')." >&2; exit 1)
-	@command -v wasm-opt >/dev/null 2>&1 || (echo "wasm-opt was not found on PATH. TinyGo's wasm build shells out to it; install binaryen (e.g. 'brew install binaryen')." >&2; exit 1)
-	$(TINYGO) build -target wasm -no-debug -ldflags="-X main.embeddedTrustedOrigin=$(WASM_TRUSTED_ORIGIN) -X main.embeddedTransportPublicKey=$(WASM_TRUSTED_TRANSPORT_KEY) -X main.embeddedTransportKeyID=$(WASM_TRUSTED_TRANSPORT_KEY_ID) -X main.embeddedResponseSigningPublicKey=$(WASM_TRUSTED_RESPONSE_KEY) -X main.embeddedResponseSigningKeyID=$(WASM_TRUSTED_RESPONSE_KEY_ID)" -o web/wasm/securefetch.wasm github.com/oarkflow/fh/wasm/cmd/securefetch
+	@command -v $(TINYGO) >/dev/null 2>&1 || (echo "tinygo was not found on PATH. Install it (e.g. 'brew install tinygo') or use 'make wasm-docker'." >&2; exit 1)
+	@command -v wasm-opt >/dev/null 2>&1 || (echo "wasm-opt was not found on PATH (install binaryen) or use 'make wasm-docker'." >&2; exit 1)
+	$(TINYGO) build -target wasm -no-debug -o web/wasm/securefetch.wasm github.com/oarkflow/fh/wasm/cmd/securefetch
 	@echo "tinygo build: $$(wc -c < web/wasm/securefetch.wasm) bytes"
 	cp "$$($(GO) list -m -f '{{.Dir}}' github.com/oarkflow/fh)/wasm/cmd/securefetch/wasm_exec.js" web/wasm/wasm_exec.js
 	$(GO) run github.com/oarkflow/fh/wasm/cmd/manifest -dir web/wasm
+
+wasm-docker:
+	docker run --rm -v "$$PWD":/src -w /src -e GOFLAGS=-buildvcs=false tinygo/tinygo:latest \
+		tinygo build -target wasm -no-debug -o web/wasm/securefetch.wasm github.com/oarkflow/fh/wasm/cmd/securefetch
+	cp "$$($(GO) list -m -f '{{.Dir}}' github.com/oarkflow/fh)/wasm/cmd/securefetch/wasm_exec.js" web/wasm/wasm_exec.js
+	$(GO) run github.com/oarkflow/fh/wasm/cmd/manifest -dir web/wasm
+
+# One-off encrypted database snapshot into APP_BACKUP_DIR (set APP_BACKUP_KEY).
+backup:
+	$(GO) run ./cmd/server -backup
+
+# Real server + real headless Chrome + the real UI. Needs `make frontend` first.
+e2e:
+	node scripts/e2e.mjs

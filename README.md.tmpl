@@ -192,6 +192,14 @@ make frontend  # build web/public/app.js + app.css from web/frontend/src (requir
 ├── internal/config/                validated environment and secret-file loading
 ├── internal/database/              squealx/SQLite store, migration, health check
 ├── internal/httpapi/               web, auth, bootstrap, health, and API routes
+├── internal/shield/                load-adaptive proof-of-work DDoS shield
+├── internal/state/                 session/limiter storage: file-backed or Redis
+├── internal/backup/                encrypted SQLite snapshots and verified restore
+├── scripts/                        production-init.sh (secrets), e2e.mjs (browser test)
+├── Dockerfile, docker-compose.yml  hardened container build and deployment
+├── .github/                        CI workflow and Dependabot
+├── internal/edge/                  trusted-proxy real IP, origin lock, PROXY protocol, deny list
+├── deploy/                         nftables, sysctl, nginx, systemd and the DDoS runbook
 ├── web/templates/                  secure SPL server-rendered templates
 ├── web/public/                     compiled browser JS/CSS (build output - run `make frontend`; not checked in)
 ├── web/frontend/                   FH Control Center: the @oarkflow/lithe frontend source
@@ -560,8 +568,9 @@ The server enables the following layers in deliberate order:
 3. TLS early-data rejection and Fetch Metadata isolation.
 4. CSP, clickjacking, MIME-sniffing, referrer, permissions, COOP/CORP/COEP, and
    production-only HSTS headers.
-5. Exact-origin credentialed CORS, global body limits, cooperative handler
-   timeouts, per-IP rate limiting, and signed sessions.
+5. Exact-origin credentialed CORS, then the **DDoS shield** (free while calm,
+   proof-of-work under load - see below), global body limits, cooperative
+   handler timeouts, per-IP rate limiting, and signed sessions.
 6. FH encrypted WASM transport for `/api/*`, session/device binding, one-time
    registration grants, replay defenses, and security-event logging.
 7. RFC 9421 Ed25519 signatures over the outer encrypted response.
@@ -576,6 +585,58 @@ SPL stays in secure mode, which rejects script elements in rendered templates.
 After SPL validates the page, the route appends one constant same-origin module
 loader for `/assets/app.js`; neither template data nor request input can alter
 that tag, and CSP restricts scripts to the application origin.
+
+### DDoS shield (pressure-priced admission)
+
+`internal/shield` makes a flood expensive for the attacker instead of the
+server. It measures pressure (in-flight requests and a smoothed arrival rate
+against `APP_SHIELD_CAPACITY` / `APP_SHIELD_RATE`). Below 50% nothing happens.
+Above it, a client without a valid pass gets `429 pow_required` with a signed
+SHA-256 hashcash puzzle whose difficulty climbs from 10 to `APP_SHIELD_MAX_BITS`
+as pressure rises. The browser solves it (`web/wasm/pow.mjs`, milliseconds to
+~2s), redeems it at `POST /_pow` for an HttpOnly pass cookie, and retries.
+
+- Stateless verification: challenges and passes are HMACs (key derived from the
+  session secret), bound to the client's /24 (IPv4) or /64 (IPv6) and
+  User-Agent. Rejecting a request costs one HMAC; nothing is stored per client.
+- Solutions are single-use (bounded replay cache that fails closed).
+- A solved pass carries a request budget (`APP_SHIELD_PASS_BUDGET`), so one
+  solve cannot become an unlimited flood.
+- Offenders are struck and then banned (30s, doubling per repeat, max 1h): invalid
+  or replayed solutions, ignoring challenges, and blowing a pass budget. Banned
+  IPs get a cheap `403` before anything else runs, and shed traffic is not
+  logged, audited or metered per request (a flood cannot fill the disk).
+- `web/wasm/shield-boot.js` is loaded before the app and wraps `fetch`, so the
+  page and the secure-fetch transport solve puzzles transparently, in Web
+  Workers, with no frontend code changes.
+- Wire it into the frontend with `withShield(secureFetch)` from `pow.mjs`.
+  Non-browser API clients must implement the `GET /_pow` / `POST /_pow` flow.
+- `GET /_ops/shield` (operations token) reports pressure, difficulty and counters.
+- It complements, not replaces, the per-IP limiter, `WithMaxInFlightRequests`
+  and tcpguard, and your CDN/WAF for volumetric L3/L4 floods. See `Suggestions.md`.
+
+### Reverse proxies, CDNs and volumetric attacks
+
+The shield, limiter and bans all key on the client IP, so behind a proxy the
+real client address must be recovered correctly (`internal/edge`):
+
+- `APP_TRUSTED_PROXIES` - CIDRs of your proxies/CDN. Forwarding headers
+  (`X-Forwarded-For`, `Forwarded`, `CF-Connecting-IP`, ...) are believed **only**
+  from those peers, and chains are walked right-to-left so a forged leftmost
+  value is ignored. Empty means "directly exposed": headers are never trusted.
+- `APP_ORIGIN_LOCK` (default on when proxies are set) - connections from any
+  other peer get `403`, so attackers cannot bypass the CDN by hitting the origin.
+- `APP_PROXY_PROTOCOL=on` - for L4 load balancers speaking HAProxy PROXY v1/v2
+  (strict: only from `APP_TRUSTED_PROXIES`; anything else is dropped at TCP level).
+- `APP_DENY_CIDRS` - static blocked networks, checked first.
+- `APP_LOGIN_RATE_LIMIT` - a much tighter per-IP budget for `/auth/login` and `/secure-config.json`.
+- `POST /_ops/shield/attack?on=1|0` - operator "under attack" switch (maximum difficulty now).
+
+An application cannot stop a flood that fills the network link. `deploy/` ships
+the layers that do: `nftables.conf` (SYN/connection caps, origin allow-list),
+`sysctl-ddos.conf` (SYN cookies, backlog, rp_filter), `nginx.conf` (slow-client and
+per-IP limits), `fh-app.service` (resource ceilings and sandbox) and `DDOS.md`
+(layered setup checklist and incident runbook). Put a CDN/scrubbing service in front.
 
 ## Routes
 
@@ -597,6 +658,9 @@ that tag, and CSP restricts scripts to the application origin.
 | `POST` | `/api/notes` | Encrypted + authenticated + RBAC | Create a note owned by the caller |
 | `PUT` | `/api/notes/:id` | Encrypted + authenticated + owner policy | Update an owned note (or one allowed by admin policy) |
 | `DELETE` | `/api/notes/:id` | Encrypted + authenticated + owner policy | Delete an owned note (or one allowed by admin policy) |
+| `GET`, `POST` | `/_pow` | Public (pressure-gated clients only) | Fetch / redeem a proof-of-work puzzle for a pass cookie |
+| `GET` | `/_ops/shield` | Operations bearer token | DDoS shield pressure, difficulty and counters |
+| `POST` | `/_ops/shield/attack?on=1` | Operations bearer token | Force the shield to maximum difficulty (`on=0` releases) |
 | `GET` | `/_ops/metrics` | Operations bearer token | JSON/Prometheus request metrics |
 | `GET` | `/_ops/health`, `/_ops/live`, `/_ops/ready` | Operations bearer token | Detailed health/readiness |
 | `GET` | `/_ops/runtime`, `/_ops/routes` | Operations bearer token | Runtime and route diagnostics |
@@ -629,6 +693,22 @@ binary unchanged.
 | `APP_REQUEST_TIMEOUT` | `15s` | Handler execution budget |
 | `APP_MAX_BODY_BYTES` | `1048576` | Global request body limit |
 | `APP_RATE_LIMIT` | `120` | Requests per client IP per minute |
+| `APP_TRUSTED_PROXIES` | empty | CIDRs of proxies/CDN whose forwarding headers are trusted |
+| `APP_PROXY_PROTOCOL` | `off` | `on` accepts PROXY protocol v1/v2 from the trusted proxies |
+| `APP_ORIGIN_LOCK` | `on` if proxies set | Refuse peers that are not trusted proxies |
+| `APP_DENY_CIDRS` | empty | Statically blocked client networks |
+| `APP_LOGIN_RATE_LIMIT` | `10` | Login/bootstrap attempts per client IP per minute |
+| `APP_UNDER_ATTACK` | `off` | `on` starts with the shield at maximum difficulty |
+| `APP_STATE_DIR` | `data` | Directory for file-backed sessions/limiters and default backups |
+| `APP_REDIS_URL` / `_FILE` | empty | Shared sessions + rate limits (multi-instance) |
+| `APP_BACKUP_INTERVAL` | `6h` prod / off dev | Snapshot interval, or `off` |
+| `APP_BACKUP_DIR` / `APP_BACKUP_KEEP` | `data/backups` / `14` | Snapshot location and retention |
+| `APP_BACKUP_KEY` / `_FILE` | empty | 32-byte base64url AES-256 key; required in production when backups are on |
+| `APP_SHIELD` | `on` | `off` disables the proof-of-work DDoS shield |
+| `APP_SHIELD_CAPACITY` | `1000` | In-flight requests treated as 100% pressure |
+| `APP_SHIELD_RATE` | `2000` | Requests/second treated as 100% pressure |
+| `APP_SHIELD_PASS_BUDGET` | `600` | Requests/min one solved pass may make while the shield is active |
+| `APP_SHIELD_MAX_BITS` | `22` | Maximum puzzle difficulty (each bit doubles client work; max 28) |
 
 Development origin policy is intentionally explicit:
 
@@ -668,31 +748,22 @@ openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
 Use distinct values for each purpose and environment. Rotate keys using new
 explicit key IDs and a controlled deployment overlap.
 
-## Secure WASM production build
+## Secure WASM bundle
 
 WASM encryption is additional application-layer protection; it does not replace
-TLS, authentication, authorization, validation, or endpoint policy. For a
-production build, provide the complete immutable public trust bundle:
+TLS, authentication, authorization, validation, or endpoint policy. The browser
+pins the server's transport key and response-signing key from
+`/secure-config.json` (served over TLS) and verifies the WASM and runtime
+scripts against `asset-manifest.json` (subresource integrity) before using
+them. Nothing is compiled into the artifact, so **keys can be rotated without a
+rebuild**; they must only be persistent (`APP_SECURE_TRANSPORT_KEY_FILE`,
+`APP_RESPONSE_SIGNING_PRIVATE_KEY_FILE`). Generate them with `make keys` or
+`sh scripts/production-init.sh https://app.example.com`.
 
-```sh
-export WASM_TRUSTED_ORIGIN='https://app.example.com'
-export WASM_TRUSTED_TRANSPORT_KEY='<X25519 public value from make keys>'
-export WASM_TRUSTED_TRANSPORT_KEY_ID='app-transport-v1'
-export WASM_TRUSTED_RESPONSE_KEY='<Ed25519 public value from make keys>'
-export WASM_TRUSTED_RESPONSE_KEY_ID='app-response-v1'
-make wasm
-```
-
-This embeds the origin and both public keys/key IDs in `securefetch.wasm` and
-regenerates `asset-manifest.json`. The server validates the manifest at startup;
-the browser verifies WASM and runtime SRI before use. Publish the artifact hash
-through an independently authenticated release channel. Never embed private
-keys, session secrets, passwords, database credentials, or bearer tokens in
-JavaScript or WASM.
-
-The checked-in WASM bundle is for loopback development. Production refuses a
-runtime-only trust configuration: the trust anchors must be compiled into the
-artifact.
+Rebuild the bundle only when upgrading `github.com/oarkflow/fh` (`make wasm`, or
+`make wasm-docker` if you have no local TinyGo that supports your Go version);
+this also regenerates `asset-manifest.json`. Never embed private keys, session
+secrets, passwords, database credentials, or bearer tokens in JavaScript or WASM.
 
 ## Database
 
@@ -714,24 +785,63 @@ curl -H "Authorization: Bearer $APP_OPERATIONS_TOKEN" 'http://localhost:8080/_op
 Keep `/_ops/*` private at the network layer as defense in depth. The route list,
 runtime data, readiness errors, and metrics reveal operational details.
 
-## Production deployment checklist
+## Production deployment
 
-- Set `APP_ENV=production` and an HTTPS `APP_ORIGIN`.
-- Store all private values in a secret manager and expose them with `_FILE`.
-- Use persistent transport/signing keys; ephemeral keys are development-only.
-- Build the WASM artifact with all five matching `WASM_TRUSTED_*` values.
+**Bootstrap (once):**
+
+```sh
+sh scripts/production-init.sh https://app.example.com   # generates ./secrets/* (0600, git-ignored)
+cp .env.example .env   # then set APP_ENV=production, APP_ORIGIN, APP_TRUSTED_PROXIES
+docker network create fh-edge                            # attach your reverse proxy (NPM, Traefik, ...) to it
+docker compose up -d --build
+```
+
+The image is a multi-stage build (frontend bundle, pure-Go server, distroless
+non-root runtime). `docker-compose.yml` runs it with a read-only root filesystem,
+all capabilities dropped, `no-new-privileges`, PID/memory/CPU ceilings, bounded
+logs, file-based secrets, **no published host port**, and a built-in
+healthcheck (`server -healthcheck`). Add Redis for multi-instance state with
+`docker compose --profile redis up -d` (see the comments in the compose file).
+
+**Durable state.** Sessions survive restarts (file-backed in `APP_STATE_DIR`, or
+Redis with `APP_REDIS_URL` for several instances; Redis also backs the rate
+limiters). If Redis is unreachable requests fail closed within ~2s and `/_ops/ready`
+reports it.
+
+**Backups.** In production the server snapshots SQLite every 6h (`APP_BACKUP_INTERVAL`),
+keeps `APP_BACKUP_KEEP` (14), and **requires `APP_BACKUP_KEY`** (AES-256-GCM; generate
+with `go run ./cmd/server -generate-backup-key`). Snapshots are `0600` and tamper-evident.
+Also copy them off the host - a backup on the same disk does not survive the disk.
+
+```sh
+server -backup                      # snapshot now (or: make backup)
+mv data/app.db data/app.db.damaged  # restore never overwrites an existing database
+server -restore latest              # or: server -restore data/backups/app-<time>.db.enc
+```
+
+Startup runs `PRAGMA quick_check` and refuses to serve a corrupt database.
+
+**CI** (`.github/workflows/ci.yml`): gofmt, vet, `go test -race`, `govulncheck`,
+Redis integration tests, the Node tests, a real-browser end-to-end test
+(`make frontend && make e2e`), and a container build + healthcheck. Dependabot
+tracks Go, npm, Docker and Actions.
+
+**Checklist**
+
+- `APP_ENV=production` and an HTTPS `APP_ORIGIN`; `APP_TRUSTED_PROXIES` set to your proxy subnet.
+- All private values come from `_FILE` secrets; transport/signing keys are persistent.
 - Terminate TLS 1.3 at FH or a correctly configured trusted reverse proxy.
-- Replace the demonstration password login with OIDC/WebAuthn or your identity
-  system, and implement application-specific roles and authorization rules.
+- Replace the demonstration password login with OIDC/WebAuthn or your identity system,
+  and implement application-specific roles and authorization rules.
 - Restrict `/_ops/*` at both the bearer-token and network layers.
-- Back up the database, run versioned migrations, and configure monitoring.
-- Review CSP/CORS/Host policies when adding origins or third-party assets.
-- Run unit, integration, race, vulnerability, and browser tests in CI.
+- Copy backups off-host and rehearse a restore; run versioned migrations; add monitoring/alerts
+  on `/_ops/shield`, `/_ops/ready` and the logs (`shield_ban`, `backup failed`).
+- Apply `deploy/` firewall/kernel hardening; put a CDN/scrubbing service in front for volumetric attacks.
 - Arrange an independent review before protecting high-value or regulated data.
 
 ## Multi-instance deployments
 
-The starter’s session, rate-limit, secure-transport session, replay, nonce, and
+The starter’s session, rate-limit, shield replay cache and pressure counters, secure-transport session, replay, nonce, and
 device stores are process-local. Before horizontal scaling, provide shared
 atomic TTL-capable stores (for example Redis/Valkey) and a durable device
 registry. Encrypt secure-session key material with KMS/HSM-backed keys at rest.

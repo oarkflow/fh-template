@@ -1,0 +1,584 @@
+// Package shield is a load-adaptive, stateless proof-of-work gate ("pressure
+// priced admission") for DDoS resilience.
+//
+// Rate limiters answer "how many requests has this IP sent?". A distributed
+// flood defeats that: every bot stays under its own limit. The shield instead
+// prices admission by *server pressure*:
+//
+//   - Calm: no cost. Every request passes untouched (zero added latency).
+//   - Rising pressure: clients without a valid pass must burn CPU, solving a
+//     SHA-256 hashcash puzzle whose difficulty grows with pressure. A person
+//     solves it once (~tens of ms to ~1-2s) and receives a signed pass cookie;
+//     a botnet must pay the same price per bot, and the price rises exactly
+//     as the attack does - attacker cost scales with attack size, while the
+//     server's cost per rejected request stays one HMAC.
+//   - Verification is O(1) and allocation-light: challenges and passes are
+//     HMAC-signed and self-describing, so the server stores nothing per
+//     client (no table for an attacker to exhaust). Only a bounded replay
+//     cache remembers solved challenge salts so a solution is single-use.
+//
+// Challenges and passes are bound to the client's network prefix (/24 IPv4,
+// /64 IPv6) and User-Agent hash, so solved work cannot be farmed once and
+// fanned out across a botnet.
+package shield
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"math/bits"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/oarkflow/fh"
+)
+
+const (
+	// HeaderSolution carries "<challenge>.<counter>" on the retried request.
+	HeaderSolution = "X-FH-Pow"
+	// HeaderChallenge advertises the puzzle on a rejection.
+	HeaderChallenge = "X-FH-Challenge"
+	// HeaderBits advertises the required leading-zero bits.
+	HeaderBits = "X-FH-Challenge-Bits"
+
+	tokenLen   = 8 + 1 + 8 // expiry | bits | salt
+	macLen     = 16
+	numShards  = 16
+	maxCounter = 1 << 40
+)
+
+var b64 = base64.RawURLEncoding
+
+// Config controls the shield. Zero values select safe defaults.
+type Config struct {
+	// Secret keys the HMACs. At least 32 bytes. Required.
+	Secret []byte
+	// Capacity is the in-flight request count considered 100% pressure.
+	// Defaults to 1000.
+	Capacity int64
+	// RatePerSecond is the arrival rate considered 100% pressure (measured as
+	// a smoothed requests/second). Defaults to 2000. 0 disables rate pressure.
+	RatePerSecond float64
+	// Threshold is the pressure (0..1) at which challenges begin.
+	// Defaults to 0.5.
+	Threshold float64
+	// MinBits / MaxBits bound the difficulty. Defaults 10 and 22. Each extra
+	// bit doubles the expected client work (22 bits ~ 4M hashes).
+	MinBits, MaxBits int
+	// ChallengeTTL is how long a challenge may be solved. Default 2m.
+	ChallengeTTL time.Duration
+	// PassTTL is how long a solved pass is honoured. Default 10m.
+	PassTTL time.Duration
+	// ReplayCapacity bounds the single-use cache. Default 100000.
+	ReplayCapacity int
+	// PassBudget caps requests per solved pass per PassBudgetWindow while the
+	// shield is active, so one solved puzzle cannot be turned into an
+	// unlimited flood. Defaults 600 per 1m.
+	PassBudget       int
+	PassBudgetWindow time.Duration
+	// StrikeLimit strikes within StrikeWindow ban the offending IP for
+	// BanBase, doubling per repeat up to BanMax. Strikes are earned by
+	// invalid or replayed solutions, ignoring challenges (hammering), and
+	// blowing a pass budget - never by ordinary traffic. Defaults 8 / 1m /
+	// 30s / 1h.
+	StrikeLimit  float64
+	StrikeWindow time.Duration
+	BanBase      time.Duration
+	BanMax       time.Duration
+	// HammerLimit is how many challenges one IP may receive per 10s without
+	// solving one before each further request earns a strike. Default 100.
+	HammerLimit int
+	// EndpointRate is the per-IP request cap on the shield endpoint per 10s.
+	// Default 30.
+	EndpointRate int
+	// MaxTracked bounds each tracking table. Default 50000.
+	MaxTracked int
+	// ExtraPressure, when set, is max()-combined with local pressure. Use it
+	// to feed shared fleet-wide load (for example from Redis) so every
+	// instance raises difficulty together.
+	ExtraPressure func() float64
+	// Secure marks the pass cookie Secure and uses the __Host- prefix.
+	Secure bool
+	// Path is the shield's own endpoint (default "/_pow"): GET returns the
+	// current puzzle (bits=0 when calm); POST with HeaderSolution redeems it
+	// for a pass cookie. Plain HTTP on purpose, so it works even when normal
+	// API calls travel inside an encrypted envelope that cannot carry the
+	// solution header.
+	Path string
+	// Skip exempts requests (static assets, health, ops).
+	Skip func(fh.Ctx) bool
+	// Force, when non-nil, overrides measured pressure (0..1). For tests and
+	// for an operator "under attack" switch.
+	Force func() (pressure float64, active bool)
+	// OnEvent receives "challenge", "solved", "invalid", "replay", "pass".
+	// Must not block.
+	OnEvent func(event, ip string, bits int)
+	// Now is injectable for tests.
+	Now func() time.Time
+}
+
+// Shield is the middleware and its state.
+type Shield struct {
+	cfg      Config
+	inflight atomic.Int64
+	// Smoothed arrival rate: window counter + EWMA, updated lock-free-ish.
+	rateMu     sync.Mutex
+	winStart   time.Time
+	winCount   int64
+	rateEWMA   float64
+	replay     [numShards]replayShard
+	perShard   int
+	cookieName string
+
+	strikes, budgets, endpoints *tracker
+
+	Challenged, Solved, Rejected, Passed, Banned, BudgetExceeded atomic.Uint64
+}
+
+type replayShard struct {
+	mu   sync.Mutex
+	seen map[uint64]int64 // salt -> expiry unix
+}
+
+// New validates cfg and returns the shield.
+func New(cfg Config) (*Shield, error) {
+	if len(cfg.Secret) < 32 {
+		return nil, errors.New("shield: Secret must be at least 32 bytes")
+	}
+	if cfg.Capacity <= 0 {
+		cfg.Capacity = 1000
+	}
+	if cfg.RatePerSecond == 0 {
+		cfg.RatePerSecond = 2000
+	}
+	if cfg.Threshold <= 0 || cfg.Threshold >= 1 {
+		cfg.Threshold = 0.5
+	}
+	if cfg.MinBits <= 0 {
+		cfg.MinBits = 10
+	}
+	if cfg.MaxBits <= 0 {
+		cfg.MaxBits = 22
+	}
+	if cfg.MaxBits > 28 {
+		cfg.MaxBits = 28
+	}
+	if cfg.MinBits > cfg.MaxBits {
+		return nil, errors.New("shield: MinBits exceeds MaxBits")
+	}
+	if cfg.ChallengeTTL <= 0 {
+		cfg.ChallengeTTL = 2 * time.Minute
+	}
+	if cfg.PassTTL <= 0 {
+		cfg.PassTTL = 10 * time.Minute
+	}
+	if cfg.ReplayCapacity <= 0 {
+		cfg.ReplayCapacity = 100_000
+	}
+	if cfg.PassBudget <= 0 {
+		cfg.PassBudget = 600
+	}
+	if cfg.PassBudgetWindow <= 0 {
+		cfg.PassBudgetWindow = time.Minute
+	}
+	if cfg.StrikeLimit <= 0 {
+		cfg.StrikeLimit = 8
+	}
+	if cfg.StrikeWindow <= 0 {
+		cfg.StrikeWindow = time.Minute
+	}
+	if cfg.BanBase <= 0 {
+		cfg.BanBase = 30 * time.Second
+	}
+	if cfg.BanMax <= 0 {
+		cfg.BanMax = time.Hour
+	}
+	if cfg.HammerLimit <= 0 {
+		cfg.HammerLimit = 100
+	}
+	if cfg.EndpointRate <= 0 {
+		cfg.EndpointRate = 30
+	}
+	if cfg.MaxTracked <= 0 {
+		cfg.MaxTracked = 50_000
+	}
+	if cfg.Path == "" {
+		cfg.Path = "/_pow"
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	s := &Shield{cfg: cfg, perShard: cfg.ReplayCapacity/numShards + 1, cookieName: "fh_pass"}
+	if cfg.Secure {
+		s.cookieName = "__Host-fh_pass"
+	}
+	s.strikes = newTracker(cfg.MaxTracked)
+	s.budgets = newTracker(cfg.MaxTracked)
+	s.endpoints = newTracker(cfg.MaxTracked)
+	for i := range s.replay {
+		s.replay[i].seen = make(map[uint64]int64)
+	}
+	return s, nil
+}
+
+// Pressure returns the current 0..1+ pressure.
+func (s *Shield) Pressure() float64 {
+	if s.cfg.Force != nil {
+		if p, ok := s.cfg.Force(); ok {
+			return p
+		}
+	}
+	p := float64(s.inflight.Load()) / float64(s.cfg.Capacity)
+	if s.cfg.RatePerSecond > 0 {
+		s.rateMu.Lock()
+		r := s.rateEWMA
+		s.rateMu.Unlock()
+		if rp := r / s.cfg.RatePerSecond; rp > p {
+			p = rp
+		}
+	}
+	if s.cfg.ExtraPressure != nil {
+		if ep := s.cfg.ExtraPressure(); ep > p {
+			p = ep
+		}
+	}
+	return p
+}
+
+// Bits maps pressure to difficulty; 0 means no challenge.
+func (s *Shield) Bits(pressure float64) int {
+	if pressure < s.cfg.Threshold {
+		return 0
+	}
+	span := 1 - s.cfg.Threshold
+	f := (pressure - s.cfg.Threshold) / span
+	if f > 1 {
+		f = 1
+	}
+	return s.cfg.MinBits + int(f*float64(s.cfg.MaxBits-s.cfg.MinBits)+0.5)
+}
+
+func (s *Shield) observe(now time.Time) {
+	s.rateMu.Lock()
+	if s.winStart.IsZero() {
+		s.winStart = now
+	}
+	s.winCount++
+	if el := now.Sub(s.winStart); el >= 500*time.Millisecond {
+		inst := float64(s.winCount) / el.Seconds()
+		// Fast attack, slow decay: a flood is noticed within one window,
+		// relief is granted gradually so the gate does not flap.
+		if inst > s.rateEWMA {
+			s.rateEWMA = 0.7*inst + 0.3*s.rateEWMA
+		} else {
+			s.rateEWMA = 0.2*inst + 0.8*s.rateEWMA
+		}
+		s.winStart, s.winCount = now, 0
+	}
+	s.rateMu.Unlock()
+}
+
+// Middleware returns the fh handler. Place it before anything expensive
+// (sessions, policy engines, body parsing, crypto).
+func (s *Shield) Middleware() fh.HandlerFunc {
+	return func(c fh.Ctx) error {
+		if c.Path() == s.cfg.Path {
+			return s.endpoint(c)
+		}
+		if s.cfg.Skip != nil && s.cfg.Skip(c) {
+			return c.Next()
+		}
+		now := s.cfg.Now()
+		ip := c.IP()
+		// Banned offenders are dropped first, before any other work, and
+		// stay dropped even when the server is calm.
+		if until, banned := s.strikes.banned(ip, now); banned {
+			return s.blocked(c, until, now)
+		}
+		s.observe(now)
+		s.inflight.Add(1)
+		defer s.inflight.Add(-1)
+
+		bitsNeeded := s.Bits(s.Pressure())
+		if bitsNeeded == 0 {
+			return c.Next()
+		}
+		binding := bindingFor(ip, c.Get("User-Agent"))
+
+		if pass := c.GetCookie(s.cookieName); s.validPass(pass, binding, now) {
+			// A pass is not a licence to flood: it carries a request budget.
+			if int(s.budgets.hit(pass, 1, s.cfg.PassBudgetWindow, now)) > s.cfg.PassBudget {
+				s.BudgetExceeded.Add(1)
+				s.event("budget", ip, bitsNeeded)
+				s.strike(ip, 1, now)
+				c.Set("Retry-After", strconv.Itoa(int(s.cfg.PassBudgetWindow.Seconds())))
+				return c.Status(fh.StatusTooManyRequests).JSON(fh.Map{"error": "pass_budget_exceeded"})
+			}
+			s.Passed.Add(1)
+			return c.Next()
+		}
+		if sol := c.Get(HeaderSolution); sol != "" {
+			if err := s.verify(sol, binding, now); err == nil {
+				s.Solved.Add(1)
+				s.event("solved", ip, bitsNeeded)
+				s.setPass(c, binding, now)
+				return c.Next()
+			} else if errors.Is(err, errReplay) {
+				s.event("replay", ip, bitsNeeded)
+				s.strike(ip, 2, now)
+			} else {
+				s.event("invalid", ip, bitsNeeded)
+				s.strike(ip, 2, now)
+			}
+		}
+		// Hammering: many challenges, no solution. A real browser solves
+		// once and moves on; a bot that just keeps retrying earns strikes.
+		if int(s.strikes.hit("h:"+ip, 1, 10*time.Second, now)) > s.cfg.HammerLimit {
+			s.strike(ip, 1, now)
+		}
+		s.Challenged.Add(1)
+		s.event("challenge", ip, bitsNeeded)
+		return s.reject(c, bitsNeeded, binding, now)
+	}
+}
+
+// strike records misbehaviour and bans the IP once it adds up.
+func (s *Shield) strike(ip string, weight float64, now time.Time) {
+	if s.strikes.hit(ip, weight, s.cfg.StrikeWindow, now) >= s.cfg.StrikeLimit {
+		if d := s.strikes.ban(ip, s.cfg.BanBase, s.cfg.BanMax, now); d > 0 {
+			s.Banned.Add(1)
+			s.event("ban", ip, int(d.Seconds()))
+		}
+	}
+}
+
+func (s *Shield) blocked(c fh.Ctx, until, now time.Time) error {
+	s.Rejected.Add(1)
+	secs := int(until.Sub(now).Seconds()) + 1
+	c.Set("Retry-After", strconv.Itoa(secs))
+	c.Set("Cache-Control", "no-store")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Status(fh.StatusForbidden).JSON(fh.Map{"error": "temporarily_blocked", "retry_after": secs})
+}
+
+// endpoint serves GET (fetch puzzle) and POST (redeem solution). It does
+// only HMAC work, so it is safe to leave outside the other limiters, and it
+// is never itself gated.
+func (s *Shield) endpoint(c fh.Ctx) error {
+	now := s.cfg.Now()
+	ip := c.IP()
+	c.Set("Cache-Control", "no-store")
+	if until, banned := s.strikes.banned(ip, now); banned {
+		return s.blocked(c, until, now)
+	}
+	// Count this request like any other so the puzzle it hands out reflects
+	// the same pressure the refused request saw.
+	s.inflight.Add(1)
+	defer s.inflight.Add(-1)
+	if int(s.endpoints.hit(ip, 1, 10*time.Second, now)) > s.cfg.EndpointRate {
+		s.strike(ip, 0.5, now)
+		c.Set("Retry-After", "10")
+		return c.Status(fh.StatusTooManyRequests).JSON(fh.Map{"error": "slow_down"})
+	}
+	binding := bindingFor(ip, c.Get("User-Agent"))
+	bitsNeeded := s.Bits(s.Pressure())
+	switch c.Method() {
+	case "GET":
+		if bitsNeeded == 0 || s.validPass(c.GetCookie(s.cookieName), binding, now) {
+			return c.JSON(fh.Map{"bits": 0})
+		}
+		return c.JSON(fh.Map{"algorithm": "sha256-leading-zero-bits", "bits": bitsNeeded,
+			"challenge": s.issue(bitsNeeded, binding, now), "expires_in": int(s.cfg.ChallengeTTL.Seconds())})
+	case "POST":
+		if err := s.verify(c.Get(HeaderSolution), binding, now); err != nil {
+			event := "invalid"
+			if errors.Is(err, errReplay) {
+				event = "replay"
+			}
+			s.event(event, ip, bitsNeeded)
+			s.Rejected.Add(1)
+			s.strike(ip, 2, now)
+			return c.Status(fh.StatusForbidden).JSON(fh.Map{"error": "pow_invalid"})
+		}
+		s.Solved.Add(1)
+		s.event("solved", ip, bitsNeeded)
+		s.setPass(c, binding, now)
+		return c.SendStatus(fh.StatusNoContent)
+	}
+	c.Set("Allow", "GET, POST")
+	return c.SendStatus(fh.StatusMethodNotAllowed)
+}
+
+func (s *Shield) event(name, ip string, b int) {
+	if s.cfg.OnEvent != nil {
+		s.cfg.OnEvent(name, ip, b)
+	}
+}
+
+func (s *Shield) reject(c fh.Ctx, bitsNeeded int, binding [16]byte, now time.Time) error {
+	ch := s.issue(bitsNeeded, binding, now)
+	bs := strconv.Itoa(bitsNeeded)
+	c.Set(HeaderChallenge, ch)
+	c.Set(HeaderBits, bs)
+	c.Set("Retry-After", "1")
+	c.Set("Cache-Control", "no-store")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Status(fh.StatusTooManyRequests).JSON(fh.Map{
+		"error": "pow_required", "algorithm": "sha256-leading-zero-bits",
+		"challenge": ch, "bits": bitsNeeded,
+		"expires_in": int(s.cfg.ChallengeTTL.Seconds()),
+	})
+}
+
+// issue builds "<b64(expiry|bits|salt)>.<b64(mac)>".
+func (s *Shield) issue(bitsNeeded int, binding [16]byte, now time.Time) string {
+	var raw [tokenLen]byte
+	binary.BigEndian.PutUint64(raw[0:8], uint64(now.Add(s.cfg.ChallengeTTL).Unix()))
+	raw[8] = byte(bitsNeeded)
+	_, _ = rand.Read(raw[9:])
+	return b64.EncodeToString(raw[:]) + "." + b64.EncodeToString(s.mac('c', raw[:], binding))
+}
+
+func (s *Shield) mac(domain byte, data []byte, binding [16]byte) []byte {
+	h := hmac.New(sha256.New, s.cfg.Secret)
+	h.Write([]byte{domain})
+	h.Write(data)
+	h.Write(binding[:])
+	return h.Sum(nil)[:macLen]
+}
+
+var (
+	errInvalid = errors.New("shield: invalid solution")
+	errReplay  = errors.New("shield: solution already used")
+)
+
+// verify checks "<challenge>.<counter>": signature, binding, expiry,
+// difficulty, the hash itself, and single use.
+func (s *Shield) verify(sol string, binding [16]byte, now time.Time) error {
+	i := strings.LastIndexByte(sol, '.')
+	if i <= 0 || len(sol) > 128 {
+		return errInvalid
+	}
+	challenge, counterStr := sol[:i], sol[i+1:]
+	counter, err := strconv.ParseUint(counterStr, 10, 64)
+	if err != nil || counter > maxCounter {
+		return errInvalid
+	}
+	j := strings.IndexByte(challenge, '.')
+	if j <= 0 {
+		return errInvalid
+	}
+	raw, err1 := b64.DecodeString(challenge[:j])
+	tag, err2 := b64.DecodeString(challenge[j+1:])
+	if err1 != nil || err2 != nil || len(raw) != tokenLen {
+		return errInvalid
+	}
+	if !hmac.Equal(tag, s.mac('c', raw, binding)) {
+		return errInvalid
+	}
+	expiry := int64(binary.BigEndian.Uint64(raw[0:8]))
+	if now.Unix() > expiry {
+		return errInvalid
+	}
+	// The difficulty is whatever was signed into the challenge, but never
+	// less than what the server demands right now minus slack for drift.
+	need := int(raw[8])
+	if floor := s.Bits(s.Pressure()) - 2; need < floor {
+		return errInvalid
+	}
+	sum := sha256.Sum256([]byte(challenge + ":" + counterStr))
+	if leadingZeroBits(sum[:]) < need {
+		return errInvalid
+	}
+	return s.markUsed(binary.BigEndian.Uint64(raw[9:17]), expiry, now.Unix())
+}
+
+func (s *Shield) markUsed(salt uint64, expiry, now int64) error {
+	sh := &s.replay[salt%numShards]
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if _, dup := sh.seen[salt]; dup {
+		return errReplay
+	}
+	if len(sh.seen) >= s.perShard {
+		for k, exp := range sh.seen { // evict expired
+			if exp < now {
+				delete(sh.seen, k)
+			}
+		}
+		if len(sh.seen) >= s.perShard {
+			// Fail closed: a full cache of live entries means a solve flood;
+			// refuse rather than allow replay.
+			return errInvalid
+		}
+	}
+	sh.seen[salt] = expiry
+	return nil
+}
+
+func (s *Shield) setPass(c fh.Ctx, binding [16]byte, now time.Time) {
+	var raw [8]byte
+	binary.BigEndian.PutUint64(raw[:], uint64(now.Add(s.cfg.PassTTL).Unix()))
+	val := b64.EncodeToString(raw[:]) + "." + b64.EncodeToString(s.mac('p', raw[:], binding))
+	c.SetCookie(&fh.Cookie{
+		Name: s.cookieName, Value: val, Path: "/", MaxAge: int(s.cfg.PassTTL.Seconds()),
+		HttpOnly: true, Secure: s.cfg.Secure, SameSite: fh.SameSiteStrict,
+	})
+}
+
+func (s *Shield) validPass(v string, binding [16]byte, now time.Time) bool {
+	i := strings.IndexByte(v, '.')
+	if i <= 0 || len(v) > 64 {
+		return false
+	}
+	raw, err1 := b64.DecodeString(v[:i])
+	tag, err2 := b64.DecodeString(v[i+1:])
+	if err1 != nil || err2 != nil || len(raw) != 8 {
+		return false
+	}
+	if !hmac.Equal(tag, s.mac('p', raw, binding)) {
+		return false
+	}
+	return now.Unix() <= int64(binary.BigEndian.Uint64(raw))
+}
+
+// bindingFor ties tokens to the client's network prefix and User-Agent.
+func bindingFor(ip, ua string) [16]byte {
+	h := sha256.New()
+	h.Write([]byte(prefixOf(ip)))
+	h.Write([]byte{0})
+	h.Write([]byte(ua))
+	var out [16]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+func prefixOf(ip string) string {
+	p := net.ParseIP(ip)
+	if p == nil {
+		return ip
+	}
+	if v4 := p.To4(); v4 != nil {
+		return v4.Mask(net.CIDRMask(24, 32)).String()
+	}
+	return p.Mask(net.CIDRMask(64, 128)).String()
+}
+
+func leadingZeroBits(b []byte) int {
+	n := 0
+	for _, x := range b {
+		if x == 0 {
+			n += 8
+			continue
+		}
+		return n + bits.LeadingZeros8(x)
+	}
+	return n
+}

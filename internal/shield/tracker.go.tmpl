@@ -1,0 +1,147 @@
+package shield
+
+import (
+	"sync"
+	"time"
+)
+
+// tracker is a bounded, sharded table of fixed-window counters with optional
+// temporary bans. It backs three defences (strikes per IP, solved-pass request
+// budgets, and endpoint rate limits). It is a possible attack surface itself
+// - an attacker can present endless distinct keys - so it is built to stay
+// cheap under that: each shard is hard-capped, expired entries are purged at
+// most once per second per shard (amortised, never per request), and when a
+// shard is still full of live entries a new key is simply left untracked
+// (fail-open for accounting, never unbounded memory, never an O(n) scan per
+// request).
+type tracker struct {
+	shards   [numShards]trackShard
+	perShard int
+}
+
+type trackShard struct {
+	mu        sync.Mutex
+	m         map[string]*trackEntry
+	lastPurge int64 // unix nanos
+}
+
+type trackEntry struct {
+	count    float64
+	start    int64 // window start, unix nanos
+	window   int64 // window length, nanos (for purge)
+	banUntil int64 // unix nanos; 0 when not banned
+	bans     int   // consecutive bans, drives exponential backoff
+}
+
+func newTracker(capacity int) *tracker {
+	t := &tracker{perShard: capacity/numShards + 1}
+	for i := range t.shards {
+		t.shards[i].m = make(map[string]*trackEntry)
+	}
+	return t
+}
+
+func (t *tracker) shard(key string) *trackShard {
+	// FNV-1a; keys are short (IP / pass id).
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return &t.shards[h%numShards]
+}
+
+// entry returns the live entry for key, creating it if there is room.
+// Caller holds sh.mu. May return nil when the shard is full.
+func (t *tracker) entry(sh *trackShard, key string, now int64) *trackEntry {
+	if e, ok := sh.m[key]; ok {
+		return e
+	}
+	if len(sh.m) >= t.perShard {
+		if now-sh.lastPurge < int64(time.Second) {
+			return nil
+		}
+		sh.lastPurge = now
+		for k, e := range sh.m {
+			if e.banUntil < now && now-e.start > e.window {
+				delete(sh.m, k)
+			}
+		}
+		if len(sh.m) >= t.perShard {
+			return nil
+		}
+	}
+	e := &trackEntry{start: now}
+	sh.m[key] = e
+	return e
+}
+
+// hit adds weight to key's fixed window and returns the new total (0 when the
+// table is saturated and the key could not be tracked).
+func (t *tracker) hit(key string, weight float64, window time.Duration, now time.Time) float64 {
+	n := now.UnixNano()
+	sh := t.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	e := t.entry(sh, key, n)
+	if e == nil {
+		return 0
+	}
+	if n-e.start > int64(window) {
+		e.start, e.count = n, 0
+	}
+	e.window = int64(window)
+	e.count += weight
+	return e.count
+}
+
+// banned reports whether key is banned and until when.
+func (t *tracker) banned(key string, now time.Time) (time.Time, bool) {
+	n := now.UnixNano()
+	sh := t.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e, ok := sh.m[key]; ok && e.banUntil > n {
+		return time.Unix(0, e.banUntil), true
+	}
+	return time.Time{}, false
+}
+
+// ban bans key for base<<bans (capped at max), doubling on each repeat
+// offence, and clears its strike count. Returns the ban duration (0 if the
+// table was saturated).
+func (t *tracker) ban(key string, base, max time.Duration, now time.Time) time.Duration {
+	n := now.UnixNano()
+	sh := t.shard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	e := t.entry(sh, key, n)
+	if e == nil {
+		return 0
+	}
+	d := base
+	for i := 0; i < e.bans && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	e.bans++
+	e.count = 0
+	e.banUntil = n + int64(d)
+	if e.window < int64(d) {
+		e.window = int64(d)
+	}
+	return d
+}
+
+// len returns the number of tracked keys (for stats/tests).
+func (t *tracker) len() int {
+	total := 0
+	for i := range t.shards {
+		t.shards[i].mu.Lock()
+		total += len(t.shards[i].m)
+		t.shards[i].mu.Unlock()
+	}
+	return total
+}
