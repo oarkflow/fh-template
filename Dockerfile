@@ -2,7 +2,7 @@
 # Multi-stage, reproducible build -> tiny non-root image with a read-only rootfs.
 
 # --- 1. frontend bundle (needs web/frontend; skipped output is web/public) ---
-FROM node:22-bookworm-slim AS frontend
+FROM node:26-bookworm-slim AS frontend
 WORKDIR /src/web/frontend
 COPY web/frontend/package.json web/frontend/package-lock.json* ./
 RUN npm ci --no-audit --no-fund
